@@ -1,27 +1,27 @@
 {
   "schemaVersion": 1,
   "target": "x86_64-pc-windows-msvc",
-  "verifiedAt": "2026-10-30",
+  "verifiedAt": "2026-10-31",
   "scope": "锁定安装的 npm 完整依赖树（含开发工具）、Windows cargo metadata 已解析依赖树（含构建/宏）、随包 Node、Rust 标准库和 WebView2Loader SDK。其他平台 npm 可选二进制单列排除；并非精确二进制 SBOM。",
   "inputs": [
     {
       "path": "package.json",
-      "sha256": "2f518e444bcb9b63d8e3b6d03c1d381b212083549eca60855a739e670ad675c2",
+      "sha256": "380ad85696ecbac1c19edf5a5d1a826cbe667efad1ff807cb14732beaa3ee9c7",
       "normalizeLf": true
     },
     {
       "path": "package-lock.json",
-      "sha256": "539d46add5a698d1ad9c6e34f812fc71cba1fdb7670d79e5362f64cd79743c73",
+      "sha256": "0579a79ecdd406333410713f2d8368e629f65bbfeeedd6c3e4846d62b837b4f1",
       "normalizeLf": true
     },
     {
       "path": "src-tauri/Cargo.lock",
-      "sha256": "d8f412d576d7eea9195a9a0b5bea41e9b5ff44dafe174b755f95e81ee42e4728",
+      "sha256": "66f038d56757f6a124d228879ed9678c80cbf59f18e7f63ebbef6026f6432281",
       "normalizeLf": true
     },
     {
       "path": "src-tauri/Cargo.toml",
-      "sha256": "b88f73b850e8c11de4533d969c7c24a2aec08edf65e77e433d1409ed82a8b0ec",
+      "sha256": "a323268365ca8e37b81fa78e1868693845f2016661bbc6c115e78cc675811547",
       "normalizeLf": true
     },
     {
@@ -41,7 +41,7 @@
         "normalizeLf": true
       }
     ],
-    "review": "两套完整安装器源码归档及 inventory.json/COMPONENTS.md 由每次发布的同版来源附件提供，其他许可材料继续随安装包提供。2026-10-16 新增 Windows 依赖 tauri-plugin-single-instance 2.5.4 与 tracing-attributes 0.1.31，已补齐原文与组件索引并刷新依赖输入指纹；修正单实例组件的 MIT 原文链接。2026-10-17 产品版本改为 0.3.9；已逐项确认四份清单仅产品版本变化，295 项 Windows Rust 解析依赖、422 个已安装 npm 包及锁定树中 74 个排除的平台包均与许可记录一致，仅刷新四份清单输入指纹，随包 Node 和第三方依赖未变。 2026-10-30 v0.3.16：295 项 Windows Rust 解析依赖与496项npm锁定包（含74项排除平台包）逐项核对未变；Rust工具链实测1.99.1，其固定提交两份根许可与随工具链标准库版权原文均与已有材料逐字节相同，更新来源版本与输入指纹。"
+    "review": "两套完整安装器源码归档及 inventory.json/COMPONENTS.md 由每次发布的同版来源附件提供，其他许可材料继续随安装包提供。2026-10-16 新增 Windows 依赖 tauri-plugin-single-instance 2.5.4 与 tracing-attributes 0.1.31，已补齐原文与组件索引并刷新依赖输入指纹；修正单实例组件的 MIT 原文链接。2026-10-17 产品版本改为 0.3.9；已逐项确认四份清单仅产品版本变化，295 项 Windows Rust 解析依赖、422 个已安装 npm 包及锁定树中 74 个排除的平台包均与许可记录一致，仅刷新四份清单输入指纹，随包 Node 和第三方依赖未变。 2026-10-30 v0.3.16：295 项 Windows Rust 解析依赖与496项npm锁定包（含74项排除平台包）逐项核对未变；Rust工具链实测1.99.1，其固定提交两份根许可与随工具链标准库版权原文均与已有材料逐字节相同，更新来源版本与输入指纹。 2026-10-31 v0.3.17：295 项 Windows Rust 解析依赖与496项npm锁定包（含74项排除平台包）逐项核对未变；Rust工具链实测1.99.1、随包Node与全部许可原文未变，仅刷新四份清单输入指纹。"
   },
   "components": [
     {

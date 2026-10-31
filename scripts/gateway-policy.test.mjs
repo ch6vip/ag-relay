@@ -4,7 +4,7 @@ import test from 'node:test'
 import http from 'node:http'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -172,6 +172,7 @@ async function fixture(t, respond, settings = policy(), extraEnv = {}, startupOn
   await getStatus()
   return {
     captured, status: getStatus,
+    diagnostics: () => readFileSync(join(dir, 'diagnostics.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
     async request(body = history, headers = {}, options = {}) {
       const response = await fetch(`${url}${options.path ?? '/v1/responses'}`, {
         method: 'POST', signal: options.signal ?? AbortSignal.timeout(12000),
@@ -185,6 +186,171 @@ async function fixture(t, respond, settings = policy(), extraEnv = {}, startupOn
     },
   }
 }
+
+const bindingMessage = 'session binding invalidated: the model this session is bound to can no longer serve it; restart the task with a new session id [trace_id=fixture code=30013]'
+const bindingHistory = {
+  ...history, prompt_cache_key: 'fixture-cache', client_metadata: { session_id: 'fixture-session', thread_id: 'fixture-thread' },
+  input: [
+    { ...history.input[0], status: 'completed' },
+    { ...history.input[1], summary: [{ type: 'summary_text', text: 'retained visible reasoning' }] },
+    { type: 'custom_tool_call', id: 'ct_fixture', call_id: 'call_fixture', name: 'fixture', input: '{"id":"nested-kept"}' },
+    { type: 'custom_tool_call_output', id: 'cto_fixture', call_id: 'call_fixture', output: 'retained tool result' },
+    history.input[2],
+  ],
+}
+const bindingIdsOnly = { ...bindingHistory, input: bindingHistory.input.map(({ id, ...item }) => item) }
+const bindingHeaders = {
+  'user-agent': 'codex_cli_rs/fixture', originator: 'codex_cli_rs', 'session-id': 'fixture-session',
+  'thread-id': 'fixture-thread', 'x-codex-window-id': 'fixture-window', 'x-codex-turn-metadata': '{"turn":"fixture"}',
+  'x-relay-session-id': 'fixture-compatibility-key',
+}
+const bindingError = (carrier = 'http', code = 'session_binding_invalidated', message = bindingMessage) =>
+  classificationError(message, carrier, code, 'invalid_request_error', 409)
+
+for (const carrier of ['http', 'json', 'sse']) {
+  test(`会话绑定 ${carrier} 错误后仅清编号并保留身份和推理`, async t => {
+    const seenHeaders = []
+    const f = await fixture(t, (_, count, req) => {
+      seenHeaders.push({ ...req.headers })
+      return count === 1 ? bindingError(carrier) : success
+    }, policy({ stripItemIds: false }))
+    assert.equal((await f.request(bindingHistory, bindingHeaders)).status, 200)
+    assert.equal(f.captured.length, 2)
+    assert.deepEqual(f.captured[0].body, bindingHistory)
+    assert.deepEqual(f.captured[1].body, bindingIdsOnly)
+    for (const [name, value] of Object.entries(bindingHeaders).filter(([name]) => name !== 'x-relay-session-id')) {
+      assert.equal(seenHeaders[0][name], value)
+      assert.equal(seenHeaders[1][name], value, `${name} 不得删改`)
+    }
+    assert.equal(seenHeaders[1].authorization, seenHeaders[0].authorization)
+    assert.equal((await f.request(bindingHistory, bindingHeaders)).status, 200)
+    assert.deepEqual(f.captured[2].body, bindingHistory, '不能记入会在下次删除推理的旧兼容缓存')
+    const diagnostics = f.diagnostics()
+    const repaired = diagnostics.find(row => row.event === 'repair_applied' && row.kind === 'session_binding_invalidated')
+    assert.equal(repaired?.removedReasoning, 0)
+    assert.equal(repaired?.removedIds, 5)
+    assert.equal(diagnostics.some(row => row.event === 'session_compat_enabled'), false)
+  })
+  for (const failure of ['binding', 'history', 'status']) {
+    test(`会话绑定 ${carrier} 修复后仍有 ${failure} 错误不升级删推理`, async t => {
+      const f = await fixture(t, (_, count) => count === 1 || failure === 'binding'
+        ? bindingError(carrier) : classificationError(failure === 'status' ? "Unknown parameter: 'input[0].status'." : staleReasoning, carrier), policy({ stripItemIds: false }))
+      const result = await f.request(bindingHistory)
+      assert.equal(result.status, carrier === 'http' && failure === 'binding' ? 409 : 400)
+      assert.equal(f.captured.length, 2)
+      assert.deepEqual(f.captured[1].body, bindingIdsOnly)
+      assert.equal(f.diagnostics().some(row => row.event === 'session_compat_enabled'), false)
+    })
+  }
+}
+
+for (const [name, extraHeaders, settings, path] of [
+  ['Claude', { 'x-relay-client': 'claude', 'user-agent': 'claude-code/fixture' }, policy({ stripItemIds: false }), '/v1/responses'],
+  ['未知客户端', { 'x-relay-client': 'unknown' }, policy({ stripItemIds: false }), '/v1/responses'],
+  ['身份冲突', { 'x-relay-client': 'codex', 'user-agent': 'claude-code/fixture' }, policy({ stripItemIds: false }), '/v1/responses'],
+  ['Messages', {}, policy({ stripItemIds: false }), '/v1/messages'],
+  ['关闭历史恢复', {}, policy({ stripItemIds: false, historyMode: 'off' }), '/v1/responses'],
+]) {
+  test(`会话绑定 不改变 ${name} 行为`, async t => {
+    const f = await fixture(t, () => bindingError(), settings)
+    assert.equal((await f.request(bindingHistory, extraHeaders, { path })).status, 409)
+    assert.equal(f.captured.length, 1)
+    assert.deepEqual(f.captured[0].body, bindingHistory)
+  })
+}
+
+for (const [name, body] of [
+  ['服务端指针', { ...bindingHistory, previous_response_id: 'resp_fixture' }],
+  ['服务端会话', { ...bindingHistory, conversation: { id: 'conv_fixture' } }],
+  ['引用项', { ...bindingHistory, input: [...bindingHistory.input, { type: 'item_reference', id: 'ref_fixture' }] }],
+  ['压缩密文', { ...bindingHistory, input: [...bindingHistory.input, { type: 'compaction', encrypted_content: 'opaque' }] }],
+  ['不完整工具', { ...bindingHistory, input: bindingHistory.input.filter(item => item.type !== 'custom_tool_call_output') }],
+  ['只带编号的推理', { ...bindingHistory, input: bindingHistory.input.map(item => item.type === 'reasoning' ? { type: 'reasoning', id: 'rs_reference', summary: [] } : item) }],
+  ['只带编号的空消息', { ...bindingHistory, input: bindingHistory.input.map(item => item.type === 'message' ? { ...item, content: [] } : item) }],
+  ['没有可删编号', bindingIdsOnly],
+]) {
+  test(`会话绑定 ${name} 拒绝改写`, async t => {
+    const f = await fixture(t, () => bindingError(), policy({ stripItemIds: false }))
+    assert.equal((await f.request(body)).status, 409)
+    assert.equal(f.captured.length, 1)
+    assert.deepEqual(f.captured[0].body, body)
+  })
+}
+
+for (const [name, code, message] of [
+  ['仅具名错误码', 'session_binding_invalidated', 'provider error'],
+  ['仅明确文案及数字码', 30013, bindingMessage],
+]) {
+  test(`会话绑定 识别${name}`, async t => {
+    const f = await fixture(t, (_, count) => count === 1 ? bindingError('http', code, message) : success, policy({ stripItemIds: false }))
+    assert.equal((await f.request(bindingHistory)).status, 200)
+    assert.deepEqual(f.captured[1].body, bindingIdsOnly)
+  })
+}
+
+test('会话绑定 不按单独数字码或无关冲突误修复', async t => {
+  const f = await fixture(t, () => bindingError('http', '30013', 'unrelated conflict'), policy({ stripItemIds: false }))
+  assert.equal((await f.request(bindingHistory)).status, 409)
+  assert.equal(f.captured.length, 1)
+})
+
+for (const status of [401, 402, 403, 429]) {
+  test(`会话绑定 不覆盖 ${status} 的明确含义`, async t => {
+    const f = await fixture(t, (_, count) => count === 1
+      ? classificationError(bindingMessage, 'http', 'session_binding_invalidated', 'invalid_request_error', status) : success,
+    policy({ stripItemIds: false }))
+    const result = await f.request(bindingHistory)
+    assert.equal(result.status, status === 429 ? 200 : status)
+    assert.ok(f.captured.every(row => JSON.stringify(row.body) === JSON.stringify(bindingHistory)))
+  })
+}
+
+test('会话绑定 首发既有清理后仅再去推理和搜索编号', async t => {
+  const f = await fixture(t, (_, count) => count === 1 ? bindingError() : success)
+  assert.equal((await f.request(bindingHistory, bindingHeaders)).status, 200)
+  assert.deepEqual(f.captured[0].body.input.filter(item => item.id).map(item => item.type), ['reasoning', 'web_search_call'])
+  assert.deepEqual(f.captured[1].body, bindingIdsOnly)
+})
+
+test('会话绑定 尊重确认次数且修复后限流仍保留完整推理', async t => {
+  const f = await fixture(t, (_, count) => count < 3 ? bindingError()
+    : count === 3 ? classificationError('rate limit', 'http', 'rate_limit_exceeded', 'rate_limit_error', 429) : success,
+  policy({ stripItemIds: false, historyConfirmations: 2 }))
+  assert.equal((await f.request(bindingHistory)).status, 200)
+  assert.equal(f.captured.length, 4)
+  assert.deepEqual(f.captured.map(row => row.body), [bindingHistory, bindingHistory, bindingIdsOnly, bindingIdsOnly])
+})
+
+test('会话绑定 常规最后一次失败仍只追加一次编号修复', async t => {
+  const f = await fixture(t, (_, count) => count === 1 ? bindingError() : success,
+    policy({ stripItemIds: false, maxAttempts: 1 }))
+  assert.equal((await f.request(bindingHistory)).status, 200)
+  assert.equal(f.captured.length, 2)
+  assert.deepEqual(f.captured[1].body, bindingIdsOnly)
+})
+
+test('会话绑定 等待修复时取消不再发送', async t => {
+  let seen
+  const received = new Promise(resolve => { seen = resolve })
+  const f = await fixture(t, () => { seen(); return bindingError() }, policy({ stripItemIds: false }), { PROXY_DEPLOY_DELAY_MS: '500' })
+  const controller = new AbortController()
+  const pending = f.request(bindingHistory, {}, { signal: controller.signal })
+  await received
+  await delay(20)
+  controller.abort()
+  await assert.rejects(pending)
+  await delay(80)
+  assert.equal(f.captured.length, 1)
+})
+
+test('会话绑定 内容交付后不重放', async t => {
+  const stream = `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'already delivered' })}\n\n${bindingError('sse').body}`
+  const f = await fixture(t, () => ({ status: 200, type: 'text/event-stream', body: stream }), policy({ stripItemIds: false }))
+  const result = await f.request(bindingHistory)
+  assert.equal(result.status, 200)
+  assert.equal(result.body, stream)
+  assert.equal(f.captured.length, 1)
+})
 
 for (const client of ['claude', 'codex']) {
   test(`错误分类 ${client} 加密历史报错中的请求编号不阻止修复`, async t => {

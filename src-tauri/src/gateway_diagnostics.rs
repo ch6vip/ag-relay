@@ -306,8 +306,8 @@ const EVENT_BASE: &[(&str, ActivityLevel, &str)] = &[
     ("precommit_failure", ActivityLevel::Warn, "流式下发前失败"),
 ];
 
-/// 子枚举中文标签表：(字段名, 枚举值) → 中文。**51 项**，按字段分组：
-/// source 6 / kind 10 / refusal 5 / terminalKind 7(含 null) / stallReason 6(含 null) /
+/// 子枚举中文标签表：(字段名, 枚举值) → 中文。**52 项**，按字段分组：
+/// source 6 / kind 11 / refusal 5 / terminalKind 7(含 null) / stallReason 6(含 null) /
 /// phase 8 / reason 6（status_repair 专属）/ status_band 3。
 /// 字段名区分同名异义值（如 refusal 与 reason 都有 wrong_endpoint/repair_exhausted/time_budget）。
 /// 取值与 diagnostics-codes.md §2 封闭枚举逐项对应。
@@ -319,9 +319,10 @@ const SUB_LABELS: &[(&str, &str, &str)] = &[
     ("source", "json_empty", "空回应（HTTP 200）"),
     ("source", "explicit_session", "显式会话"),
     ("source", "resource_lineage", "资源血缘"),
-    // kind（10）—— item 2 + peek 6 + 空回应形状 2（§2.B）
+    // kind（11）—— item 3 + peek 6 + 空回应形状 2（§2.B）
     ("kind", "azure_resource_mismatch", "跨 Azure 资源引用"),
     ("kind", "stale_reasoning_item", "失效的 reasoning 项"),
+    ("kind", "session_binding_invalidated", "会话绑定失效（仅清历史编号）"),
     ("kind", "other", "其他"),
     ("kind", "peek_timeout", "等待首个内容超时"),
     ("kind", "empty_stream_drop", "上游静默丢弃（空流）"),
@@ -611,8 +612,8 @@ mod tests {
         "http_error", "sse_precommit", "json_error", "json_empty",
         "explicit_session", "resource_lineage",
     ];
-    const EXPECTED_KIND: [&str; 10] = [
-        "azure_resource_mismatch", "stale_reasoning_item", "other", "peek_timeout",
+    const EXPECTED_KIND: [&str; 11] = [
+        "azure_resource_mismatch", "stale_reasoning_item", "session_binding_invalidated", "other", "peek_timeout",
         "empty_stream_drop", "read_timeout", "buffer_limit", "stream_error",
         "empty_stream_shape", "empty_stream_reasoning",
     ];
@@ -793,9 +794,9 @@ mod tests {
         }
     }
 
-    /// 字典键计数（可报告锚点）：23 事件基 + 51 子枚举标签 = 74；且无清单外多余条目。
-    /// 51 = source6 + kind10 + refusal5 + terminalKind7 + stallReason6 + phase8 + reason6 + band3
-    /// （前两项 23/48 即 diagnostics-codes.md 的精确锚点；band3 为壳侧派生的 HTTP 段）。
+    /// 字典键计数（可报告锚点）：23 事件基 + 52 子枚举标签 = 75；且无清单外多余条目。
+    /// 52 = source6 + kind11 + refusal5 + terminalKind7 + stallReason6 + phase8 + reason6 + band3
+    /// （前两项 23/49 为核心事件与子枚举；band3 为壳侧派生的 HTTP 段）。
     #[test]
     fn 契约_字典键计数且无清单外多余条目() {
         assert_eq!(EVENT_BASE.len(), 23, "事件基表应恰 23 项");
@@ -816,8 +817,8 @@ mod tests {
         assert_eq!(count("reason"), EXPECTED_STATUS_REPAIR_REASON.len());
         assert_eq!(count("status_band"), EXPECTED_STATUS_BAND.len());
 
-        assert_eq!(SUB_LABELS.len(), 51, "子枚举标签应恰 51 项");
-        assert_eq!(EVENT_BASE.len() + SUB_LABELS.len(), 74, "字典键总数应为 74");
+        assert_eq!(SUB_LABELS.len(), 52, "子枚举标签应恰 52 项");
+        assert_eq!(EVENT_BASE.len() + SUB_LABELS.len(), 75, "字典键总数应为 75");
     }
 
     /// 真实样本（trimmed）：读 tests/fixtures/diagnostics-samples.jsonl，逐条断言译文/级别。

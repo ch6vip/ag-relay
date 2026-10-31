@@ -380,7 +380,8 @@ function healDiagnosticsRotation() {
  * item ids removed; never recurse into content, arguments, output, or call_id.
  * Confirmed Codex history errors may opt into stateless web-search replay: remove
  * reasoning and search handles together, preserving the inline search payload.
- * This is a lossy compatibility fallback, not portable Responses validation.
+ * Dropping reasoning is lossy; handle-only recovery retains its payloads.
+ * Neither fallback is portable Responses validation.
  * Server-side history cannot be reconstructed or proven complete by this proxy.
  *
  * options:
@@ -399,7 +400,10 @@ function repairResponsesItems(bodyBuf, options = {}) {
     stripItemIds = false, stripReasoningIds = false, stripMessageType = false,
     dropReasoning = false, allowUnchanged = false, codexHistory = false, requireCompleteTools = false,
   } = options;
-  const statelessSearch = codexHistory && dropReasoning && stripItemIds;
+  // Removing both handle sets may retain the complete reasoning payload; only
+  // the explicit binding-error recovery opts into that combination.
+  const statelessSearch = codexHistory && stripItemIds && (dropReasoning || stripReasoningIds);
+  const handlesOnly = codexHistory && stripReasoningIds && !dropReasoning;
   const completeTools = codexHistory || requireCompleteTools;
   let obj;
   try { obj = JSON.parse(bodyBuf.toString('utf8')); }
@@ -426,6 +430,9 @@ function repairResponsesItems(bodyBuf, options = {}) {
     if (item.type === 'item_reference') return { error: 'item_reference requires server-side history; refusing to discard it' };
     if (item.type === 'reasoning') {
       if (dropReasoning) { removedReasoning++; continue; }
+      if (handlesOnly && Object.hasOwn(item, 'id') && !nonEmptyStr(item.encrypted_content)) {
+        return { error: 'reasoning handle lacks inline encrypted content; refusing to discard its reference' };
+      }
       if (stripReasoningIds && Object.hasOwn(item, 'id')) {
         delete item.id;
         removedIds++;
@@ -437,6 +444,10 @@ function repairResponsesItems(bodyBuf, options = {}) {
       if (!['user', 'assistant', 'system', 'developer'].includes(item.role)
           || !(typeof item.content === 'string' || Array.isArray(item.content))) {
         return { error: 'message does not contain inline role/content' };
+      }
+      if (handlesOnly && Object.hasOwn(item, 'id')
+          && (typeof item.content === 'string' ? !item.content.trim() : !item.content.length)) {
+        return { error: 'empty message may reference server-side content; refusing to discard its handle' };
       }
       if (stripMessageType && Object.hasOwn(item, 'type')) {
         delete item.type;
@@ -726,6 +737,9 @@ function classifyError(info, status = 200) {
   const deployment = !permanent && isDeploymentError(evidence);
   const retryable = !permanent && (deployment || status === 408 || status === 429 || status >= 500 || isRetryableError(info));
   let kind = permanent ? (quota ? 'quota' : 'permanent') : deployment ? 'deployment' : retryable ? 'retryable' : 'unknown';
+  const sessionBindingInvalidated = kind === 'unknown' && [200, 400, 409].includes(status)
+    && (String(info?.code || '').toLowerCase() === 'session_binding_invalidated'
+      || /\bsession binding invalidated\b[\s\S]*\bnew session id\b/i.test(message));
   let historyKind = null;
   let missingSearchReasoning = false;
   let statusIndex = null;
@@ -744,7 +758,7 @@ function classifyError(info, status = 200) {
       }
     }
   }
-  return { kind, info, message, permanent, quota, deployment, retryable, historyKind, missingSearchReasoning, statusIndex };
+  return { kind, info, message, permanent, quota, deployment, retryable, historyKind, missingSearchReasoning, statusIndex, sessionBindingInvalidated };
 }
 
 // 诊断用：把上游错误压成有界的指纹（错误码 + 命中的关键词），绝不落盘原文。
@@ -1244,6 +1258,7 @@ async function handle(req, res, state) {
   // 全部请求，再叠上这条上限，纯限流也只能试 3 次就放弃（生产一天 83 次，配置的
   // 110 次形同虚设）。没报过历史错误的请求按通用预算重试。
   let historyRepairApplied = false;
+  let bindingIdRepairApplied = false;
   let postRepairSends = 0;
   let frozenHistoryKind = null;
   diagnose('received', isResponses ? { shape: summarizeResponsesBody(body) } : {});
@@ -1319,6 +1334,7 @@ async function handle(req, res, state) {
       sendPermanent(res, `Unsupported input status field: ${reason}. Correct the upstream request conversion.`);
       return 'stop';
     };
+    if (bindingIdRepairApplied) return refuse('repair_exhausted');
     if (!isResponses) return refuse('wrong_endpoint');
     if (repairedStatus || (eligibleCodex && historyRepairChecked)) return refuse('repair_exhausted');
     if (status !== 400 && status !== 200) return refuse('unexpected_status');
@@ -1343,6 +1359,46 @@ async function handle(req, res, state) {
 
   // Called uniformly for HTTP errors, pre-commit SSE errors and 200 JSON errors.
   const handleItemError = (classification, attempt, source, status) => {
+    if (classification.sessionBindingInvalidated && eligibleCodex && policy.historyMode !== 'off') {
+      const kind = 'session_binding_invalidated';
+      // A retry is useful only with a changed request. Refusal or repeated failure
+      // must stop, including SSE/200 error envelopes, rather than discard reasoning.
+      classification.permanent = true;
+      classification.retryable = false;
+      diagnose('item_error', { kind, source, status, shape: summarizeResponsesBody(activeBody) });
+      const refuse = (refusal) => {
+        diagnose('repair_refused', { kind, source, status, refusal });
+        return null;
+      };
+      if (bindingIdRepairApplied || repairedItems) return refuse('repair_exhausted');
+      if (preflightRefused) return refuse('unsafe_inline_history');
+      if (deadline - Date.now() < cfg.minRetryWindowMs + cfg.deployDelayMs) return refuse('time_budget');
+      const confirmations = (historyErrorCounts.get(kind) || 0) + 1;
+      historyErrorCounts.set(kind, confirmations);
+      if (confirmations < policy.historyConfirmations) {
+        return attempt < maxAttempts ? 'retry' : refuse('time_budget');
+      }
+      const repaired = repairResponsesItems(activeBody, {
+        stripItemIds: true, stripReasoningIds: true, codexHistory: true,
+      });
+      if (repaired.error) return refuse('unsafe_inline_history');
+      activeBody = repaired.body;
+      bindingIdRepairApplied = true;
+      repairedItems = true;
+      repairCount++;
+      maxAttempts = Math.max(maxAttempts, attempt + 1);
+      // Never register this in the old compatibility cache: that cache means
+      // dropReasoning on the next request. Client headers/metadata stay untouched.
+      diagnose('repair_applied', { kind, source, status, removedIds: repaired.removedIds, removedReasoning: 0 });
+      log(`attempt ${attempt}: ${kind}: removed item ids=${repaired.removedIds}; reasoning and client identity retained`);
+      return 'retry';
+    }
+    if (bindingIdRepairApplied && classification.kind === 'history') {
+      classification.permanent = true;
+      classification.retryable = false;
+      diagnose('repair_refused', { kind: classification.historyKind, source, status, refusal: 'repair_exhausted' });
+      return null;
+    }
     if (classification.kind !== 'history' || (classification.missingSearchReasoning && !eligibleCodex)) return null;
     const kind = classification.historyKind;
     const azure = kind === 'azure_resource_mismatch';

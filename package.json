@@ -1,7 +1,7 @@
 {
   "name": "ag-relay",
   "private": true,
-  "version": "0.3.16",
+  "version": "0.3.17",
   "description": "AG Relay · 本地重试网关（自带核心与桌面面板）",
   "type": "module",
   "scripts": {

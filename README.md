@@ -172,7 +172,28 @@ node scripts/release.mjs test-build --out C:\Temp\ag-relay-test-artifacts
 
 注：网关核心的四个 `.mjs` 与 `gateway-config.bat` 已由 `.gitattributes` 固定为不做换行符转换（`-text`），因此任何机器上检出内容与仓库内容一致、哈希唯一。此前 `.bat` 未固定：仓库内容为 LF、Windows 检出为 CRLF，两者哈希不同。下表 v0.2.0/v0.3.1 条目记录的是当时**磁盘检出**（CRLF）的值 `102865c8…`，属历史留档不回填；v0.3.2 及以后记录的是**仓库内容**（LF）的值 `9a8a483e…`。
 
-### v0.3.16（当前）
+### v0.3.17（当前）
+
+| 项 | 值 |
+| --- | --- |
+| 打包日期 | 2026-10-31 23:05（UTC+8） |
+| 发布日期 | 2026-10-31 23:11（UTC+8） |
+| 本仓构建提交 | `baf382aad61d5fb345b95ac44d65c905209dfb1d`（tag `v0.3.17`；构建输入已提交，未混入本地 `.gitignore` 改动与研究记录） |
+| 构建方式 | 维护者本机，原生产更新签名；不运行安装器 |
+| 验证 | 37 项新增恢复／边界检查、12 项相邻与其他客户端差分、17 项诊断契约通过，无失败或跳过；正式预检、前端构建、两种安装器验签、版本绑定、许可与产物路径检查通过；7 个远端文件摘要与本地一致；匿名 latest 清单返回 0.3.17；未安装或重启现用网关 |
+| `relay-retry-proxy.mjs` sha256 | `f2f847bc20ef455205dc9bae8d38782e3617c22b49ff914b46b2df28982e3210` |
+| `relay-supervisor.mjs` sha256 | `f2f030b46999f84afc77f7f92643075c1d1f1ddf7ad3c327fbd92f5593dff77c` |
+| `relay-start-check.mjs` sha256 | `bb54cc7255b4f570ba1bdcfda255f19f0ca0a70fa6d028d0ed4e44f8146037c4` |
+| `bounded-file-log.mjs` sha256 | `3841b877ce76e6ff37497bfbcd65e3dd4f478442dc7fff9eaf4b39612b25c205` |
+| `gateway-config.bat` sha256 | `5eff32b941b63708fa64104f09d7e28e15ff8dd569a49dc5c9d40bb1859b84f7` |
+| `ag-relay_0.3.17_x64-setup.exe` sha256 | `ff1168f64b40095c8c9210516a4a54b368c6dbd9a2173d926401c7179094fa75` |
+| `ag-relay_0.3.17_x64_zh-CN.msi` sha256 | `18be4a8600ca830456779e9f770b2bfae41184ca445894375dccfb37de725221` |
+| `third-party-sources.tar.gz` sha256 | `b9796e2bb2682c9f5467b91802c9a8cf41cd99eeb46a88b6dfae292d7cb69cb8` |
+| Release | [v0.3.17](https://github.com/xinxinxiaoxin/ag-relay/releases/tag/v0.3.17)（NSIS + MSI + 各自 `.sig` + `latest.json` + `SHA256SUMS` + 第三方源码附件） |
+
+仅在 Codex 明确会话绑定失效后尝试只去历史编号，保留身份头、推理和工具／搜索内容；不新增首发清理、不写入有损缓存、不升级删推理，Claude 保持原行为。说明见 [v0.3.17](docs/releases/v0.3.17.md)，详情见 [构建与发布记录](docs/releases/v0.3.17-build.md)。
+
+### v0.3.16（历史）
 
 | 项 | 值 |
 | --- | --- |

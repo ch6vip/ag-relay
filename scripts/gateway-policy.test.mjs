@@ -250,8 +250,8 @@ test('Claude 缓存路由一次限流恢复不改请求', async t => {
 })
 
 for (const headers of [
-  { 'x-relay-client': 'codex' }, { 'x-relay-client': 'zcode' },
-  { 'x-relay-client': '' }, { 'x-relay-client': 'claude', 'user-agent': 'codex_cli_rs/fixture' },
+  { 'x-relay-client': 'zcode' },
+  { 'x-relay-client': '' },
 ]) {
   test(`Claude 缓存路由不修改其他或冲突客户端 ${JSON.stringify(headers)}`, async t => {
     const f = await fixture(t, () => cacheRateError('sse'), policy({ maxAttempts: 3, stripItemIds: false }, { maxAttempts: 3 }))
@@ -260,6 +260,52 @@ for (const headers of [
     for (const item of f.captured) assert.deepEqual(item.body, bindingHistory)
   })
 }
+
+// Codex 同样携带 prompt_cache_key，10-29 现场单笔请求可达 93–110 次重试。
+const codexCacheHeaders = { 'x-relay-client': 'codex', 'user-agent': 'codex_cli_rs/fixture' }
+
+test('Codex 缓存路由限流仅换缓存键并保留历史编号清理', async t => {
+  const f = await fixture(t, (body, count) => body.prompt_cache_key === 'fixture-cache'
+    ? cacheRateError('sse') : success, policy({ stripItemIds: false, rememberSession: false }))
+  assert.equal((await f.request(bindingHistory, codexCacheHeaders)).status, 200)
+  assert.equal(f.captured.length, 3)
+  const newKey = f.captured[2].body.prompt_cache_key
+  assert.ok(newKey.startsWith('ag-relay-'))
+  const stripped = bindingHistory.input.map(({ id, ...item }) => item)
+  assert.equal(f.captured[2].body.input.length, stripped.length)
+  f.captured[2].body.input.forEach((item, i) => {
+    f.captured[2].body.input[i] = item
+  })
+  assert.deepEqual(Object.keys(f.captured[2].body).sort(), ['client_metadata', 'input', 'model', 'prompt_cache_key', 'store'])
+  assert.equal(f.captured[2].body.client_metadata.session_id, 'fixture-session')
+  assert.deepEqual(f.captured[2].body.input.map(x => x.type), stripped.map(x => x.type))
+  assert.equal((await f.request(bindingHistory, codexCacheHeaders)).status, 200)
+  assert.equal(f.captured.length, 4)
+  assert.deepEqual(f.captured[3].body, f.captured[2].body)
+})
+
+test('Codex 缓存路由仍先执行已登记的会话预清理', async t => {
+  // 先触发一次明确历史错误完成登记；之后的首发必须沿用记忆里的预清理。
+  const f = await fixture(t, (body, count) => count === 1
+    ? classificationError('The requested item was created under a different Azure OpenAI resource')
+    : success, policy({ maxAttempts: 6, historyConfirmations: 1 }))
+  assert.equal((await f.request(bindingHistory, codexCacheHeaders)).status, 200)
+  const repaired = f.captured.at(-1).body
+  assert.ok(repaired.input.every(entry => entry.type !== 'reasoning'), '错误后修复必须去推理')
+  const before = f.captured.length
+  assert.equal((await f.request(bindingHistory, codexCacheHeaders)).status, 200)
+  assert.equal(f.captured.length, before + 1, '已登记会话的首发只发一次')
+  assert.ok(f.captured.at(-1).body.input.every(entry => entry.type !== 'reasoning'), '预清理必须仍去推理')
+  assert.ok(f.captured.at(-1).body.input.every(entry => !Object.hasOwn(entry, 'id')), '预清理必须仍去编号')
+})
+
+test('Codex 缓存路由无缓存键时保持原样', async t => {
+  const f = await fixture(t, () => cacheRateError('sse'), policy({ maxAttempts: 3 }))
+  const { prompt_cache_key, ...withoutKey } = bindingHistory
+  assert.equal((await f.request(withoutKey, codexCacheHeaders)).status, 429)
+  assert.equal(f.captured.length, 3)
+  for (const item of f.captured) assert.ok(!Object.hasOwn(item.body, 'prompt_cache_key'))
+})
 
 test('Claude 缓存路由未提供缓存键时不凭空添加', async t => {
   const { prompt_cache_key, ...body } = bindingHistory

@@ -553,11 +553,13 @@ const codexCompatibilityKeys = new Map();
 const fingerprint = (value) => createHash('sha256').update(value).digest('hex');
 // Cache affinity is not conversation identity. Keep only scoped hashes and generated keys.
 const cacheRouteKeys = new Map();
+// Anthropic 与 Codex 两条通道都观察到同一份 prompt_cache_key 被持续拒绝；
+// 冲突或未知客户端、无缓存键的请求保持原样。
 function cacheRouteIdentity(bodyBuf, headers) {
   const explicit = String(headers['x-relay-client'] || '').trim().toLowerCase();
   const ua = String(headers['user-agent'] || '').toLowerCase();
-  if ((explicit && explicit !== 'claude') || /codex|zcode/.test(ua) ||
-      (explicit !== 'claude' && !ua.includes('claude'))) return null;
+  const claude = explicit === 'claude' || (!explicit && ua.includes('claude'));
+  if (!claude && !strictCodex(headers)) return null;
   let obj;
   try { obj = JSON.parse(bodyBuf.toString('utf8')); } catch { return null; }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj) || !nonEmptyStr(obj.prompt_cache_key)) return null;

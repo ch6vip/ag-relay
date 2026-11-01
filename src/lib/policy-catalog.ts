@@ -1,7 +1,7 @@
 import type { PolicyGroup, PolicyProfile } from '@/lib/types'
 import type { PolicyDraftProfile } from '@/lib/policy-settings'
 
-export type PolicyModuleId = 'stripItemIds' | 'historyMode' | 'rememberSession' | 'repairStatus' | 'emptyResponseRepair' | 'retryHistory'
+export type PolicyModuleId = 'stripItemIds' | 'historyMode' | 'uncoveredErrorFallback' | 'rememberSession' | 'repairStatus' | 'emptyResponseRepair' | 'retryHistory'
 export interface PolicyModule {
   id: PolicyModuleId
   title: string
@@ -28,6 +28,13 @@ export const policyModules: PolicyModule[] = [
     trigger: '默认等明确历史错误达到门槛；可改为报错前就尝试处理。',
     preserves: '可验证的正文与工具配对；遇到无法安全改写的历史，整组保留，不半剥离。',
     impact: '可能丢失旧推理连续性及资源关联。只改转发副本，不删除本地聊天记录，也不关闭模型本轮思考。',
+  },
+  {
+    id: 'uncoveredErrorFallback', title: '未覆盖错误保底', fields: 'reasoning / 适用编号', groups: ['codex', 'general'],
+    purpose: '遇到现有规则未覆盖的错误时，原样确认一次，再尝试一次有损清理，让同一段对话有机会继续。',
+    trigger: '仅明确识别的 Claude / Codex Responses 请求，且历史模式为“报错后”时参与；ZCode、未知或冲突身份不参与。两次连续合格的未覆盖错误才尝试清理，明确限流、鉴权等错误不触发。',
+    preserves: '正文、完整工具配对与参数/结果、身份和缓存键（prompt_cache_key）；不修改本地聊天记录。',
+    impact: '可能损失旧推理连续性。清理后的候选请求最多实际发送 2 次，仍受原次数与时间预算约束，不追加预算、不跨请求记忆；不能安全清理就保留当前错误。',
   },
   {
     id: 'rememberSession', title: '复用会话兼容处理', fields: 'compatibility memory', groups: ['codex', 'general'],
@@ -68,6 +75,7 @@ export function moduleTiming(module: PolicyModule, profile: PolicyProfile | Poli
   if (module.id === 'historyMode') return profile.historyMode === 'always' ? '提前处理' : '报错后'
   if (module.id === 'stripItemIds') return '提前整理'
   if (module.id === 'rememberSession') return profile.historyMode === 'on_error' ? '按会话记忆' : '暂不参与，仅报错后模式参与'
+  if (module.id === 'uncoveredErrorFallback') return profile.historyMode === 'on_error' ? '原样确认一次后保底' : '暂不参与，仅报错后模式参与'
   if (module.id === 'emptyResponseRepair') return '空回应后分级'
   return '报错后'
 }

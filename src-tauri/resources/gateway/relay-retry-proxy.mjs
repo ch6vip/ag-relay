@@ -84,7 +84,7 @@ function defaultPolicyProfile(codex) {
     maxAttempts: cfg.maxAttempts, baseDelayMs: cfg.baseDelayMs,
     maxDelayMs: cfg.maxDelayMs, totalBudgetMs: cfg.totalBudgetMs,
     connectTimeoutMs: cfg.connectTimeoutMs,
-    historyMode: 'on_error', historyConfirmations: 1,
+    historyMode: 'on_error', historyConfirmations: 1, uncoveredErrorFallback: true,
     stripItemIds: codex && cfg.codexStripIds, rememberSession: cfg.sessionCompat,
     repairStatus: true, retryHistory: codex && cfg.codexResourceRetry,
     emptyResponseRepair: !codex, emptyResponseDropReasoning: !codex,
@@ -123,7 +123,7 @@ function compilePolicy(raw) {
     integer('emptyResponseNormalizeAfter', 1, 1000);
     integer('emptyResponseReasoningAfter', 1, 1000);
     if (!['off', 'on_error', 'always'].includes(profile.historyMode)) reject(`${name}.historyMode`);
-    for (const key of ['stripItemIds', 'rememberSession', 'repairStatus', 'retryHistory',
+    for (const key of ['stripItemIds', 'rememberSession', 'repairStatus', 'retryHistory', 'uncoveredErrorFallback',
       'emptyResponseRepair', 'emptyResponseDropReasoning']) {
       if (typeof profile[key] !== 'boolean') reject(`${name}.${key}`);
     }
@@ -718,11 +718,11 @@ function errorInfoFromJson(obj) {
   const e = obj.error || (eventError ? obj.response?.error : null);
   if (!eventError && (!e || typeof e !== 'object' || Array.isArray(e))) return null;
   const field = value => typeof value === 'string' && value.trim() ? value : undefined;
-  return {
-    code: field(e?.code) || (eventError ? field(obj.code) : undefined),
-    type: field(e?.type),
-    message: field(e?.message) || (eventError ? field(obj.message) : undefined) || 'provider error',
-  };
+  const code = field(e?.code) || (eventError ? field(obj.code) : undefined);
+  const type = field(e?.type);
+  const message = field(e?.message) || (eventError ? field(obj.message) : undefined);
+  return { code, type, message: message || 'provider error',
+    structured: true, hasDetails: !!(code || type || message) };
 }
 
 function isRetryableError(info) {
@@ -778,6 +778,40 @@ function classifyError(info, status = 200) {
   return { kind, info, message, permanent, quota, deployment, retryable, historyKind, missingSearchReasoning, statusIndex, sessionBindingInvalidated };
 }
 
+// Strong non-history evidence excludes the fallback; generic "not supported" or
+// "unavailable" alone does not. Keep the established classifier unchanged.
+const FALLBACK_HARD_TEXT = /\b(?:sensitive words|content[-_ ]?(?:blocked|filter)|flagged|moderation|model not found|invalid model|unsupported model|too large|context length|context_length_exceeded|maximum context|exceed\w*[^.\r\n]*\bmax(?:imum)?[^.\r\n]*\btokens?)\b|\bmodel\b[^.\r\n]{0,120}\b(?:not supported|does not exist)\b|内容审核|违规/i;
+const FALLBACK_TRANSIENT_TEXT = /\b(?:rate[ _-]?limit|too many requests|tokens? per minute|requests? per minute|overload(?:ed)?|high demand|capacity|timeout|timed out|bad gateway|internal (?:server )?error|network error|connection (?:failed|reset)|(?:service|server|gateway)(?: is)?(?: temporarily)? unavailable)\b|\b(?:HTTP(?: status(?: code)?)?|status(?: code)?|error(?: code)?)\s*[:=]?\s*(?:408|429|502|503|504)\b/i;
+function fallbackHardKind(info, status) {
+  const codes = [info?.code, info?.type].map(value => String(value || '').toLowerCase());
+  const message = errorCauseText(info?.message);
+  const reportedStatus = Number(/\b(?:HTTP(?: status(?: code)?)?|status(?: code)?|error(?: code)?)\s*[:=]?\s*(\d{3})\b/i.exec(message)?.[1]);
+  if (status === 402 || reportedStatus === 402 || codes.some(code => QUOTA_CODES.has(code)) || QUOTA_TEXT.test(message)) return 'quota';
+  if ([401, 403, 413].includes(status) || [401, 403, 413].includes(reportedStatus) || codes.some(code => PERMANENT_CODES.has(code)
+      || ['forbidden', 'invalid_model_id'].includes(code))
+      || PERMANENT_TEXT.test(message) || FALLBACK_HARD_TEXT.test(message)) return 'permanent';
+  return null;
+}
+function isUncoveredFallbackError(failure) {
+  const { classification, status, source, kind } = failure;
+  const info = classification.info;
+  if (!info || info.hasDetails === false || fallbackHardKind(info, status)) return false;
+  if (classification.kind === 'history' || classification.kind === 'status'
+      || classification.sessionBindingInvalidated || classification.deployment) return false;
+  if (source === 'sse_precommit' && kind !== 'stream_error') return false;
+  if (status === 200) {
+    if (!info.structured) return false;
+  } else if ([404, 500].includes(status)) {
+    if (!info.structured) return false;
+  } else if (![400, 409, 422].includes(status)) return false;
+  const message = errorCauseText(info.message);
+  if (!message.trim() || /<\/?(?:html|head|body)\b|<!doctype\b/i.test(message)) return false;
+  const codes = [info.code, info.type].map(value => String(value || '').toLowerCase());
+  if (codes.some(code => (code !== 'upstream_error' && RETRYABLE_CODES.has(code))
+      || code === 'rate_limit_error' || cfg.extraRetryCodes.includes(code))) return false;
+  return !FALLBACK_TRANSIENT_TEXT.test(message) && !DEPLOYMENT_TEXT.test(message);
+}
+
 // 诊断用：把上游错误压成有界的指纹（错误码 + 命中的关键词），绝不落盘原文。
 // 上游错误文案会随中转站改动，指纹让我们能判断「某个已知类别换了说法」还是「新类别」。
 const ERROR_HINTS = ['different', 'resource', 'masked', 'persisted', 'encrypted', 'not found',
@@ -826,6 +860,13 @@ function strictCodex(headers) {
   const ua = String(headers['user-agent'] || '').trim().toLowerCase();
   if ((explicit && explicit !== 'codex') || /claude|zcode/.test(ua)) return false;
   return explicit === 'codex' || /^codex(?:_cli_rs|_vscode|_desktop)?(?:\/|\s|$)/.test(ua);
+}
+
+function strictClaude(headers) {
+  const explicit = String(headers['x-relay-client'] || '').trim().toLowerCase();
+  const ua = String(headers['user-agent'] || '').trim().toLowerCase();
+  if ((explicit && explicit !== 'claude') || /codex|zcode/.test(ua)) return false;
+  return explicit === 'claude' || ua.includes('claude');
 }
 
 // Request-local observations never participate in retry or routing decisions.
@@ -1362,6 +1403,11 @@ async function handle(req, res, state) {
   // Classification must not change when a user disables a recovery action.
   const eligibleCodex = clientCodex && (hasPolicySettings || cfg.codexResourceRetry);
   const policy = isResponses ? policySettings.profiles[eligibleCodex ? 'codex' : 'general'] : defaultPolicyProfile(false);
+  const fallbackEnabled = isResponses && (eligibleCodex || strictClaude(headers))
+    && policy.historyMode === 'on_error' && policy.uncoveredErrorFallback;
+  const fallback = { phase: 'idle', remainingSends: 0 };
+  const fallbackSpent = () => fallback.phase === 'applied' && fallback.remainingSends === 0;
+  const resetFallbackConfirmation = () => { if (fallback.phase === 'confirming') fallback.phase = 'idle'; };
   const codexResourceRetry = isResponses && clientClass(headers) === 'codex'
     && (hasPolicySettings ? policySettings.profiles.codex.retryHistory : cfg.codexResourceRetry);
   let historyRepairChecked = false;
@@ -1434,7 +1480,7 @@ async function handle(req, res, state) {
   const outOfBudget = () => Date.now() >= deadline;
   // A capped attempt must not spend another backoff interval before discovering the cap.
   const retrySleep = (ms) => {
-    if (eligibleCodex && historyRepairApplied && postRepairSends >= 3) return Promise.resolve();
+    if (fallbackSpent() || (eligibleCodex && historyRepairApplied && postRepairSends >= 3)) return Promise.resolve();
     if (!ac.signal.aborted) state.phase = 'retry_waiting';
     return sleep(ms, ac.signal);
   };
@@ -1687,6 +1733,57 @@ async function handle(req, res, state) {
     }
   };
 
+  const fallbackKind = 'uncovered_error_fallback';
+  const canRetryFallback = (attempt, delayMs) => !ac.signal.aborted && !res.destroyed
+    && attempt < maxAttempts && !fallbackSpent()
+    && deadline - Date.now() >= cfg.minRetryWindowMs + delayMs;
+  const finishFallbackFailure = (failure, refusal = 'repair_exhausted') => {
+    fallback.phase = 'closed';
+    diagnose('repair_refused', { kind: fallbackKind, source: failure.source, status: failure.status, refusal });
+    observeRequest(state, 'result', 'error_passthrough');
+    if (failure.source === 'sse_precommit') {
+      const info = failure.classification.info;
+      const error = { code: info?.code || 'upstream_error', type: info?.type || 'upstream_error',
+        message: info?.message || failure.reason };
+      passthrough(res, 502, new Headers({ 'content-type': 'application/json; charset=utf-8' }),
+        Buffer.from(JSON.stringify({ error }), 'utf8'));
+    } else {
+      passthrough(res, failure.status, failure.headers, failure.buffer);
+    }
+    return 'stop';
+  };
+  const tryUncoveredFallback = async (failure, attempt) => {
+    if (!fallbackEnabled || fallback.phase === 'closed' || repairedItems || repairedStatus || repairCount
+        || bindingIdRepairApplied || historyRepairChecked || historyRepairApplied || accountReasoningRetries
+        || resourceFailures || historyErrorCounts.size || shapeRepairStage || preflightRefused || preserveResourceHistory) {
+      resetFallbackConfirmation();
+      return null;
+    }
+    const delayMs = backoffMs(attempt, policy);
+    if (!canRetryFallback(attempt, delayMs)) return finishFallbackFailure(failure, 'time_budget');
+    if (fallback.phase === 'idle') {
+      fallback.phase = 'confirming';
+      await retrySleep(delayMs);
+      return 'retry';
+    }
+    diagnose('item_error', { kind: fallbackKind, source: failure.source, status: failure.status,
+      shape: summarizeResponsesBody(activeBody) });
+    const repaired = repairResponsesItems(activeBody, {
+      stripItemIds: true, dropReasoning: true, codexHistory: eligibleCodex, requireCompleteTools: true,
+    });
+    if (repaired.error) return finishFallbackFailure(failure, 'unsafe_inline_history');
+    if (!canRetryFallback(attempt, delayMs)) return finishFallbackFailure(failure, 'time_budget');
+    activeBody = repaired.body;
+    repairedItems = true;
+    repairCount++;
+    fallback.phase = 'applied';
+    fallback.remainingSends = Math.min(2, maxAttempts - attempt);
+    diagnose('repair_applied', { kind: fallbackKind, source: failure.source, status: failure.status,
+      removedIds: repaired.removedIds, removedReasoning: repaired.removedReasoning });
+    await retrySleep(delayMs);
+    return 'retry';
+  };
+
   // Parse/commit stays with each carrier; recovery ordering and waits live here.
   // Unknown HTTP/JSON/SSE and final error envelopes deliberately remain distinct.
   const recoverFailure = async (failure, attempt) => {
@@ -1704,12 +1801,32 @@ async function handle(req, res, state) {
         code: fp ? fp.code : 'none', hints: fp ? fp.hints : '',
         masked: fp ? fp.masked : false, retryable: classification.retryable });
     }
-    const statusAction = handleStatusError(classification, attempt, source, status);
-    if (statusAction === 'stop') return 'stop';
-    if (statusAction === 'retry') return retry(cfg.deployDelayMs);
-    const itemAction = handleItemError(classification, attempt, source, status);
-    if (itemAction === 'stop') return 'stop';
-    if (itemAction === 'retry') return retry(cfg.deployDelayMs);
+    const uncovered = isUncoveredFallbackError(failure);
+    if (!uncovered) resetFallbackConfirmation();
+    if (fallback.phase === 'applied') {
+      const hard = fallbackHardKind(classification.info, status);
+      if (hard) {
+        // Freeze the candidate: no later status/history/shape repair may change it.
+        fallback.phase = 'closed';
+        classification.permanent = true;
+        classification.quota = hard === 'quota';
+      } else {
+        const delayMs = backoffMs(attempt, policy);
+        if (canRetryFallback(attempt, delayMs)) return retry(delayMs);
+        return finishFallbackFailure(failure, fallbackSpent() ? 'repair_exhausted' : 'time_budget');
+      }
+    } else {
+      const statusAction = handleStatusError(classification, attempt, source, status);
+      if (statusAction === 'stop') return 'stop';
+      if (statusAction === 'retry') return retry(cfg.deployDelayMs);
+      const itemAction = handleItemError(classification, attempt, source, status);
+      if (itemAction === 'stop') return 'stop';
+      if (itemAction === 'retry') return retry(cfg.deployDelayMs);
+      if (uncovered) {
+        const action = await tryUncoveredFallback(failure, attempt);
+        if (action) return action;
+      }
+    }
     // Repair refusal may mutate classification; inspect it only after both handlers.
     if (classification.permanent) {
       if (isHttp) {
@@ -1768,6 +1885,11 @@ async function handle(req, res, state) {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (ac.signal.aborted || res.destroyed) return;
+    if (fallbackSpent()) {
+      diagnose('repair_refused', { kind: fallbackKind, refusal: 'repair_exhausted' });
+      observeRequest(state, 'result', 'retry_exhausted');
+      return sendRetryable(res, 503, lastReason, attemptCount, policy);
+    }
     if (eligibleCodex && historyRepairApplied && postRepairSends >= 3) {
       diagnose('codex_resource_exhausted', { kind: frozenHistoryKind, resourceFailures,
         refusal: 'resource_attempt_limit' });
@@ -1807,7 +1929,9 @@ async function handle(req, res, state) {
         // `connection: close`。代价是每条请求多一次握手（相对 20–40 秒的请求可忽略）。
         // `connection` 是逐跳头，站点看到的其它请求头与指纹没有任何变化。
         // Count actual fetch calls, even when no HTTP response arrives (network failure).
+        if (ac.signal.aborted || res.destroyed) return;
         if (eligibleCodex && historyRepairApplied) postRepairSends++;
+        if (fallback.phase === 'applied') fallback.remainingSends--;
         observeRequest(state, 'attempt');
         upstream = await fetch(target, {
           method: req.method,
@@ -1817,6 +1941,7 @@ async function handle(req, res, state) {
           signal: attemptAc.signal,
         });
       } catch (e) {
+        resetFallbackConfirmation();
         if (ac.signal.aborted) return;
         if (outOfBudget()) {
           lastReason = `total budget ${policy.totalBudgetMs}ms exhausted`;
@@ -1828,6 +1953,11 @@ async function handle(req, res, state) {
           ? `upstream connect timeout after ${attemptTimeoutMs}ms`
           : `upstream connect failed: ${describeFetchError(e)}`;
         log(`attempt ${attempt}: ${lastReason}`);
+        if (fallbackSpent()) {
+          diagnose('repair_refused', { kind: fallbackKind, refusal: 'repair_exhausted' });
+          observeRequest(state, 'result', 'retry_exhausted');
+          return sendRetryable(res, 502, lastReason, attempt, policy);
+        }
         // 连接超时/失败属于通道抖动：放宽次数、缩短间隔，快速换通道
         maxAttempts = Math.max(maxAttempts, cfg.deployMaxAttempts);
         if (attempt < maxAttempts) { await retrySleep(cfg.deployDelayMs); continue; }
@@ -1879,14 +2009,25 @@ async function handle(req, res, state) {
       const info = errorInfoFromJson(obj);
       if (info) {
         const action = await recoverFailure({ source: 'json_error', status: upstream.status,
-          classification: classifyError(info), headers: upstream.headers }, attempt);
+          classification: classifyError(info), headers: upstream.headers, buffer: buf }, attempt);
         if (action === 'retry') continue;
         if (action === 'stop') return;
       }
 
       if (obj && isEmptyCompletion(obj)) {      // 空回应
+        resetFallbackConfirmation();
         lastReason = 'empty response (HTTP 200 but message.content is blank)';
         log(`attempt ${attempt}: ${lastReason}`);
+        if (fallback.phase === 'applied') {
+          if (canRetryFallback(attempt, cfg.deployDelayMs)) {
+            await retrySleep(cfg.deployDelayMs);
+            continue;
+          }
+          diagnose('repair_refused', { kind: fallbackKind, source: 'json_empty', status: 200,
+            refusal: fallbackSpent() ? 'repair_exhausted' : 'time_budget' });
+          observeRequest(state, 'result', 'retry_exhausted');
+          return sendRetryable(res, 502, lastReason, attempt, policy);
+        }
         notePreCommitFailure(attempt, 'json_empty');
         if (attempt < maxAttempts) {
           log('  -> upstream closed the stream with no content, retrying for another route');

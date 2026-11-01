@@ -28,7 +28,7 @@ const history = {
 function policy(codex = {}, general = {}) {
   const defaults = {
     maxAttempts: 5, baseDelayMs: 10, maxDelayMs: 10, totalBudgetMs: 10000, connectTimeoutMs: 2000,
-    historyMode: 'on_error', historyConfirmations: 1,
+    historyMode: 'on_error', historyConfirmations: 1, uncoveredErrorFallback: true,
     stripItemIds: true, rememberSession: true, repairStatus: true, retryHistory: true,
     emptyResponseRepair: false, emptyResponseDropReasoning: false,
     emptyResponseNormalizeAfter: 2, emptyResponseReasoningAfter: 6,
@@ -223,6 +223,252 @@ for (const client of ['claude', 'codex']) {
     })
   }
 }
+
+test('未覆盖错误保底：Claude 原样确认后一次去旧推理，下一请求不继承', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'fallback-client-cache' }
+  const expected = { ...recoveredToolHistory, prompt_cache_key: body.prompt_cache_key }
+  const f = await fixture(t, candidate => candidate.input.some(item => item.type === 'reasoning')
+    ? classificationError('Opaque session envelope rejected by provider', 'http', 'fresh_provider_error') : success)
+  const headers = { 'x-relay-client': 'claude', 'user-agent': 'claude-cli/fixture' }
+  assert.equal((await f.request(body, headers)).status, 200)
+  assert.deepEqual(f.captured.map(item => item.body), [body, body, expected])
+  assert.equal((await f.request(body, headers)).status, 200)
+  assert.deepEqual(f.captured.slice(3).map(item => item.body), [body, body, expected])
+  assert.equal(f.diagnostics().filter(row => row.event === 'repair_applied' && row.kind === 'uncovered_error_fallback').length, 2)
+  assert.equal(f.diagnostics().some(row => row.event === 'session_compat_enabled'), false)
+})
+
+for (const client of ['claude', 'codex']) {
+  for (const carrier of ['http', 'json', 'sse']) {
+    for (const [name, message] of [
+      ['陌生文案', 'Opaque envelope rejected'],
+      ['泛化不可用', 'Session representation is unavailable'],
+      ['泛化不支持', 'Opaque representation is not supported'],
+    ]) {
+      test(`未覆盖错误保底 ${client}/${carrier}/${name} 两次原样后候选最多两发`, async t => {
+        const body = { ...toolHistory, prompt_cache_key: 'fallback-cache', client_metadata: { session_id: 'keep-session' } }
+        const expected = { ...recoveredToolHistory, prompt_cache_key: body.prompt_cache_key, client_metadata: body.client_metadata }
+        const f = await fixture(t, (_, count) => count <= 3
+          ? classificationError(count === 2 ? `${message}; updated wording` : message, carrier, 'fresh_provider_error')
+          : success, policy({ stripItemIds: false }))
+        const headers = { 'x-relay-client': client, 'user-agent': client === 'codex' ? 'codex_cli_rs/fixture' : 'claude-cli/fixture' }
+        assert.equal((await f.request(body, headers)).status, 200)
+        assert.deepEqual(f.captured.map(item => item.body), [body, body, expected, expected])
+        assert.equal(f.captured[0].raw, f.captured[1].raw)
+        assert.equal(f.captured[2].raw, f.captured[3].raw)
+        assert.equal(f.diagnostics().filter(row => row.event === 'repair_applied' && row.kind === 'uncovered_error_fallback').length, 1)
+      })
+    }
+  }
+}
+
+for (const carrier of ['http', 'json', 'sse']) {
+  test(`未覆盖错误保底 ${carrier} 持续失败仅四次且返回末次错误`, async t => {
+    const f = await fixture(t, (_, count) => classificationError(`opaque failure ${count}`, carrier, `fresh_${count}`),
+      policy({ stripItemIds: false }, { maxAttempts: 20 }))
+    const response = await f.request(toolHistory, { 'x-relay-client': 'claude' })
+    assert.equal(f.captured.length, 4)
+    assert.equal(response.status, carrier === 'http' ? 400 : carrier === 'sse' ? 502 : 200)
+    assert.equal(JSON.parse(response.body).error.code, 'fresh_4')
+    assert.deepEqual(f.captured.map(item => item.body), [toolHistory, toolHistory, recoveredToolHistory, recoveredToolHistory])
+    const [summary] = await f.summaries()
+    assert.equal(summary.attempts, 4)
+    assert.equal(summary.result, 'error_passthrough')
+  })
+}
+
+for (const after of ['rate-then-server', 'network', 'empty-json', 'empty-sse']) {
+  test(`未覆盖错误保底 候选后${after}仍最多两次实际发送`, async t => {
+    const f = await fixture(t, (_, count, req) => {
+      if (count <= 2) return classificationError('opaque rejection', 'http', 'new_error')
+      if (after === 'network') { req.socket.destroy(); return success }
+      if (after === 'empty-json') return { status: 200, body: { content: [] } }
+      if (after === 'empty-sse') return { status: 200, type: 'text/event-stream', body: '' }
+      return count === 3 ? classificationError('token rate limit exceeded', 'http', 'rate_limit_exceeded', 'too_many_requests', 429)
+        : classificationError('Service temporarily unavailable', 'http', 'server_error', 'server_error', 503)
+    }, policy({}, { maxAttempts: 20 }), { PROXY_DEPLOY_MAX_ATTEMPTS: '30' })
+    await f.request(toolHistory, { 'x-relay-client': 'claude' })
+    assert.equal(f.captured.length, 4)
+    assert.deepEqual(f.captured.slice(2).map(item => item.body), [recoveredToolHistory, recoveredToolHistory])
+    assert.equal(f.diagnostics().filter(row => row.event === 'repair_applied').length, 1)
+  })
+}
+
+for (const maxAttempts of [1, 2, 3, 4]) {
+  test(`未覆盖错误保底 不突破原总次数${maxAttempts}`, async t => {
+    const f = await fixture(t, () => classificationError('opaque rejection', 'http', 'new_error'),
+      policy({}, { maxAttempts }))
+    await f.request(toolHistory, { 'x-relay-client': 'claude' })
+    assert.equal(f.captured.length, maxAttempts)
+    assert.equal(f.captured.filter(item => !item.body.input.some(entry => entry.type === 'reasoning')).length, Math.max(0, maxAttempts - 2))
+  })
+}
+
+for (const carrier of ['http', 'json', 'sse']) {
+  for (const [name, message, code, type] of [
+    ['限流', 'token rate limit exceeded', 'rate_limit_exceeded', 'too_many_requests'],
+    ['无代码限流', 'Too many requests', undefined, 'invalid_request_error'],
+    ['鉴权', 'opaque rejection', 'new_error', 'authentication_error'],
+    ['额度', 'opaque rejection', 'new_error', 'insufficient_quota'],
+    ['内容', 'Request blocked by content filter', 'new_error', 'invalid_request_error'],
+    ['模型', 'The model is not supported', 'new_error', 'invalid_request_error'],
+    ['长度', 'maximum context length exceeded', 'new_error', 'invalid_request_error'],
+    ['过大', 'request too large', 'new_error', 'invalid_request_error'],
+    ['超时', 'request timed out', 'new_error', 'invalid_request_error'],
+    ['繁忙', 'Service temporarily unavailable', 'new_error', 'invalid_request_error'],
+    ['服务错误', 'opaque rejection', 'server_error', 'server_error'],
+    ['容量', 'system experiencing high demand', 'new_error', 'invalid_request_error'],
+    ['部署', 'No deployment to match', 'new_error', 'invalid_request_error'],
+  ]) {
+    test(`未覆盖错误保底 排除${carrier}/${name}且原体不变`, async t => {
+      const f = await fixture(t, () => classificationError(message, carrier, code, type), policy({ stripItemIds: false }))
+      await f.request(toolHistory, { 'x-relay-client': 'claude' })
+      for (const item of f.captured) assert.deepEqual(item.body, toolHistory)
+      assert.equal(f.diagnostics().some(row => row.kind === 'uncovered_error_fallback'), false)
+    })
+  }
+}
+
+for (const [status, structured, eligible] of [[404, true, true], [500, true, true], [422, false, true],
+  [404, false, false], [500, false, false], [401, true, false], [402, true, false], [403, true, false],
+  [408, true, false], [413, true, false], [429, true, false], [502, true, false], [503, true, false], [504, true, false]]) {
+  test(`未覆盖错误保底 HTTP${status}/${structured ? '结构化' : '纯文本'}的资格`, async t => {
+    const f = await fixture(t, candidate => !candidate.input.some(item => item.type === 'reasoning') ? success
+      : { status, body: structured ? { error: { code: 'new_error', message: 'Opaque envelope rejection' } } : 'Opaque envelope rejection' })
+    await f.request(toolHistory, { 'x-relay-client': 'claude' })
+    assert.equal(f.diagnostics().some(row => row.event === 'repair_applied' && row.kind === 'uncovered_error_fallback'), eligible)
+    if (!eligible) for (const item of f.captured) assert.deepEqual(item.body, toolHistory)
+  })
+}
+
+for (const reply of [
+  { status: 400, body: '<html><body>unknown failure</body></html>' },
+  { status: 200, body: { error: {} } },
+  { status: 200, body: { error: { code: 123, message: {} } } },
+  { status: 200, body: { output: [{ type: 'message', content: [{ type: 'output_text', text: 'opaque rejection is not supported' }] }] } },
+]) {
+  test(`未覆盖错误保底 不把HTML或无证据及成功正文当候选 ${JSON.stringify(reply)}`, async t => {
+    const f = await fixture(t, () => reply)
+    await f.request(toolHistory, { 'x-relay-client': 'claude' })
+    for (const item of f.captured) assert.deepEqual(item.body, toolHistory)
+    assert.equal(f.diagnostics().some(row => row.kind === 'uncovered_error_fallback'), false)
+  })
+}
+
+for (const interruption of ['rate', 'server', 'network', 'empty-json', 'empty-sse']) {
+  test(`未覆盖错误保底 ${interruption}打断后重新原样确认`, async t => {
+    const f = await fixture(t, (_, count, req) => {
+      if (count === 2) {
+        if (interruption === 'network') { req.socket.destroy(); return success }
+        if (interruption === 'empty-json') return { status: 200, body: { content: [] } }
+        if (interruption === 'empty-sse') return { status: 200, type: 'text/event-stream', body: '' }
+        return classificationError(interruption === 'rate' ? 'token rate limit exceeded' : 'Service unavailable',
+          'http', interruption === 'rate' ? 'rate_limit_exceeded' : 'server_error', 'invalid_request_error', interruption === 'rate' ? 429 : 503)
+      }
+      return count <= 4 ? classificationError('opaque rejection', 'http', 'new_error') : success
+    }, policy({}, { maxAttempts: 8 }))
+    assert.equal((await f.request(toolHistory, { 'x-relay-client': 'claude' })).status, 200)
+    assert.deepEqual(f.captured.map(item => item.body), [toolHistory, toolHistory, toolHistory, toolHistory, recoveredToolHistory])
+  })
+}
+
+for (const [name, headers, settings, path] of [
+  ['ZCode', { 'x-relay-client': 'zcode' }, policy(), '/v1/responses'],
+  ['未知', { 'x-relay-client': 'other' }, policy(), '/v1/responses'],
+  ['Claude冲突', { 'x-relay-client': 'claude', 'user-agent': 'codex_cli_rs/fixture' }, policy(), '/v1/responses'],
+  ['Codex冲突', { 'x-relay-client': 'codex', 'user-agent': 'claude-cli/fixture' }, policy(), '/v1/responses'],
+  ['其他端点', { 'x-relay-client': 'claude' }, policy(), '/v1/messages'],
+  ['关闭保底', { 'x-relay-client': 'claude' }, policy({}, { uncoveredErrorFallback: false }), '/v1/responses'],
+  ['关闭历史', { 'x-relay-client': 'claude' }, policy({}, { historyMode: 'off' }), '/v1/responses'],
+]) {
+  test(`未覆盖错误保底 不扩大${name}的原行为`, async t => {
+    const f = await fixture(t, () => classificationError('opaque rejection', 'http', 'new_error'), settings)
+    assert.equal((await f.request(toolHistory, headers, { path })).status, 400)
+    assert.deepEqual(f.captured.map(item => item.body), [toolHistory])
+    assert.equal(f.diagnostics().some(row => row.kind === 'uncovered_error_fallback'), false)
+  })
+}
+
+test('未覆盖错误保底 两组开关互不影响', async t => {
+  const f = await fixture(t, body => body.input.some(item => item.type === 'reasoning')
+    ? classificationError('opaque rejection', 'http', 'new_error') : success,
+  policy({ stripItemIds: false, uncoveredErrorFallback: false }))
+  assert.equal((await f.request(toolHistory, { 'x-relay-client': 'codex' })).status, 400)
+  assert.equal((await f.request(toolHistory, { 'x-relay-client': 'claude' })).status, 200)
+  assert.deepEqual(f.captured.map(item => item.body), [toolHistory, toolHistory, toolHistory, recoveredToolHistory])
+})
+
+test('未覆盖错误保底 时间不足不启动原样确认或剥离', async t => {
+  const f = await fixture(t, () => classificationError('opaque rejection', 'http', 'new_error'),
+    policy({}, { totalBudgetMs: 1000, connectTimeoutMs: 1000, baseDelayMs: 300, maxDelayMs: 300 }),
+    { PROXY_MIN_RETRY_WINDOW_MS: '900' })
+  assert.equal((await f.request(toolHistory, { 'x-relay-client': 'claude' })).status, 400)
+  assert.deepEqual(f.captured.map(item => item.body), [toolHistory])
+  assert.equal(f.diagnostics().some(row => row.event === 'repair_applied'), false)
+})
+
+for (const waitingAttempt of [1, 2, 3]) {
+  test(`未覆盖错误保底 第${waitingAttempt}次后的等待可取消且不多发`, async t => {
+    const f = await fixture(t, () => classificationError('opaque rejection', 'http', 'new_error'),
+      policy({}, { baseDelayMs: 500, maxDelayMs: 500 }))
+    const controller = new AbortController()
+    const pending = f.request(toolHistory, { 'x-relay-client': 'claude' }, { signal: controller.signal }).catch(() => null)
+    let reached = false
+    const deadline = Date.now() + 4000
+    while (Date.now() < deadline) {
+      const status = await f.status()
+      if (status.requests?.some(row => row.phase === 'retry_waiting' && row.attempt === waitingAttempt)) { reached = true; break }
+      await delay(10)
+    }
+    assert.equal(reached, true)
+    controller.abort()
+    assert.equal(await pending, null)
+    await delay(550)
+    assert.equal(f.captured.length, waitingAttempt)
+    const [summary] = await f.summaries()
+    assert.equal(summary.attempts, waitingAttempt)
+    assert.equal(summary.result, 'cancelled')
+  })
+}
+
+test('未覆盖错误保底 编号和URL中的错误词不阻断真正陌生错误', async t => {
+  const message = 'opaque rejection [trace_id=unauthorized_quota_content_filter] https://example.invalid/429/context_length_exceeded'
+  const f = await fixture(t, body => body.input.some(item => item.type === 'reasoning')
+    ? classificationError(message, 'http', 'upstream_error') : success)
+  assert.equal((await f.request(toolHistory, { 'x-relay-client': 'claude' })).status, 200)
+  assert.deepEqual(f.captured.map(item => item.body), [toolHistory, toolHistory, recoveredToolHistory])
+})
+
+for (const first of [
+  { type: 'response.output_text.delta', delta: 'delivered text' },
+  { type: 'response.output_item.added', item: { type: 'function_call', name: 'fixture', call_id: 'call_delivered', arguments: '{}' } },
+]) {
+  test(`未覆盖错误保底 已交付${first.type}后陌生错误不重放`, async t => {
+    const stream = `data: ${JSON.stringify(first)}\n\ndata: {"type":"error","error":{"code":"fresh_provider_error","message":"opaque rejection"}}\n\n`
+    const f = await fixture(t, () => ({ status: 200, type: 'text/event-stream', body: stream }))
+    const response = await f.request(toolHistory, { 'x-relay-client': 'claude' })
+    assert.equal(response.body, stream)
+    assert.equal(f.captured.length, 1)
+    assert.equal(f.diagnostics().some(row => row.kind === 'uncovered_error_fallback'), false)
+  })
+}
+
+test('未覆盖错误保底 尊重独立核心的Codex恢复关闭项', async t => {
+  const f = await fixture(t, () => classificationError('opaque rejection', 'http', 'new_error'), legacyPolicy,
+    { PROXY_CODEX_RESOURCE_RETRY: '0', PROXY_CODEX_STRIP_IDS: '0' })
+  assert.equal((await f.request(toolHistory, { 'x-relay-client': 'codex' })).status, 400)
+  assert.deepEqual(f.captured.map(item => item.body), [toolHistory])
+})
+
+test('未覆盖错误保底 不把明确HTTP限流或服务故障文案当陌生历史错误', async t => {
+  for (const message of ['upstream returned HTTP 401', 'upstream returned HTTP 402', 'upstream returned HTTP 413',
+    'upstream returned HTTP 429', 'upstream returned HTTP 503']) {
+    const f = await fixture(t, () => classificationError(message, 'http', 'opaque_wrapper'))
+    await f.request(toolHistory, { 'x-relay-client': 'claude' })
+    for (const item of f.captured) assert.deepEqual(item.body, toolHistory)
+    assert.equal(f.diagnostics().some(row => row.kind === 'uncovered_error_fallback'), false)
+  }
+})
 
 test('请求诊断：正常请求恰有一份脱敏摘要作同期对照', async t => {
   const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
@@ -706,8 +952,9 @@ for (const [name, code, message] of [
   })
 }
 
-test('会话绑定 不按单独数字码或无关冲突误修复', async t => {
-  const f = await fixture(t, () => bindingError('http', '30013', 'unrelated conflict'), policy({ stripItemIds: false }))
+test('会话绑定 不按单独数字码或无关冲突误修复（关闭保底的旧行为）', async t => {
+  const f = await fixture(t, () => bindingError('http', '30013', 'unrelated conflict'),
+    policy({ stripItemIds: false, uncoveredErrorFallback: false }))
   assert.equal((await f.request(bindingHistory)).status, 409)
   assert.equal(f.captured.length, 1)
 })
@@ -1201,10 +1448,10 @@ for (const client of ['codex', 'claude']) {
   }
 }
 
-test('policy status 非精确拒绝不删除字段', async t => {
+test('policy status 非精确拒绝不删除字段（关闭保底的旧行为）', async t => {
   const raw = ' {"input":[{"type":"message","role":"user","content":"status fixture","status":"completed"}]} '
   const f = await fixture(t, () => historyError('The status is invalid for this account'),
-    policy({ repairStatus: true }))
+    policy({ repairStatus: true, uncoveredErrorFallback: false }))
   assert.equal((await f.request(raw)).status, 400)
   assert.equal(f.captured.length, 1)
   assert.equal(f.captured[0].raw, raw)

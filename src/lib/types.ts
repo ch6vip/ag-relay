@@ -12,6 +12,7 @@ export interface PolicyProfile {
   connectTimeoutMs: number
   historyMode: PolicyMode
   historyConfirmations: number
+  uncoveredErrorFallback: boolean
   stripItemIds: boolean
   rememberSession: boolean
   repairStatus: boolean

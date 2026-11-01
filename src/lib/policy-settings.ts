@@ -61,7 +61,7 @@ export function policySettingsError(settings: PolicySettings): string | null {
     if (!integer(p.emptyResponseNormalizeAfter, 1, 1000) || !integer(p.emptyResponseReasoningAfter, 1, 1000)) return `${prefix}空回应门槛须为 1–1000 的整数。`
     if (p.emptyResponseReasoningAfter <= p.emptyResponseNormalizeAfter) return `${prefix}空回应第二阶段门槛必须晚于第一阶段。`
     if (p.emptyResponseDropReasoning && !p.emptyResponseRepair) return `${prefix}空回应第二阶段依赖第一阶段，请先启用字段规范化。`
-    for (const key of ['stripItemIds', 'rememberSession', 'repairStatus', 'retryHistory', 'emptyResponseRepair', 'emptyResponseDropReasoning'] as const) {
+    for (const key of ['uncoveredErrorFallback', 'stripItemIds', 'rememberSession', 'repairStatus', 'retryHistory', 'emptyResponseRepair', 'emptyResponseDropReasoning'] as const) {
       if (typeof p[key] !== 'boolean') return `${prefix}模块开关无效：${key}。`
     }
     if (group === 'codex' && (p.emptyResponseRepair || p.emptyResponseDropReasoning)) return `${prefix}不支持通用组的空回应修复。`

@@ -21,6 +21,8 @@ pub struct PolicyProfile {
     pub connect_timeout_ms: u64,
     pub history_mode: HistoryMode,
     pub history_confirmations: u32,
+    /// 仅报错后模式、明确识别的 Claude / Codex 请求参与；其他模式保留选择。
+    pub uncovered_error_fallback: bool,
     pub strip_item_ids: bool,
     pub remember_session: bool,
     pub repair_status: bool,
@@ -100,6 +102,7 @@ impl PolicyProfile {
             connect_timeout_ms: retry_default("PROXY_CONNECT_TIMEOUT_MS"),
             history_mode: HistoryMode::OnError,
             history_confirmations: 1,
+            uncovered_error_fallback: true,
             strip_item_ids: codex,
             remember_session: true,
             repair_status: true,

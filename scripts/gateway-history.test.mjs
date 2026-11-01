@@ -883,13 +883,30 @@ test('账号绑定推理不可用：普通 503 与 429 不得改写请求体', a
   }
 })
 
+// 旧语义对照只关闭新保底；保留调用方已有环境、策略版本及两组配置。
+// 旧核心不认识 uncoveredErrorFallback，这份配置只能传给当前核心。
+function withoutUncoveredFallback(config = {}) {
+  const settings = JSON.parse(config.PROXY_POLICY_JSON ?? '{}')
+  return {
+    ...config,
+    PROXY_POLICY_JSON: JSON.stringify({
+      ...settings,
+      profiles: {
+        ...settings.profiles,
+        codex: { ...settings.profiles?.codex, uncoveredErrorFallback: false },
+        general: { ...settings.profiles?.general, uncoveredErrorFallback: false },
+      },
+    }),
+  }
+}
+
 for (const carrier of ['http', 'json', 'sse']) {
   for (const message of [
     'the upstream account bound to this conversation is unavailable',
     'start a new conversation without previous encrypted reasoning items',
   ]) {
-    test(`账号绑定推理不可用：单短语不触发修复 ${carrier}/${message.slice(0, 12)}`, async t => {
-      const f = await fixture(t, () => historyError(message, carrier))
+    test(`账号绑定推理不可用：单短语不触发修复 ${carrier}/${message.slice(0, 12)}（关闭保底的旧行为）`, async t => {
+      const f = await fixture(t, () => historyError(message, carrier), withoutUncoveredFallback())
       await f.request(accountHistory, claudeHeaders)
       for (const item of f.captured) assert.deepEqual(item.body, accountHistory)
       assert.equal(f.rows().some(row => row.event === 'repair_applied'), false)
@@ -914,6 +931,182 @@ test('账号绑定推理不可用：409后混合限流沿原预算且不记忆�
   assert.deepEqual(f.captured[4].body, accountHistory, '下一请求不能自动删推理')
 })
 
+// 未覆盖错误仅允许一次安全历史候选。期望值直接列出必须保留的完整载荷，
+// 不调用核心修复器或按核心算法生成期望；编号和旧推理只添加到输入样本中。
+const fallbackRetainedHistory = {
+  model: 'fixture-model', store: false, prompt_cache_key: 'fallback-history-cache-fixture',
+  instructions: 'fixture instructions retained',
+  client_metadata: { session_id: 'fixture-fallback-session', extension: { id: 'metadata_id_keep' } },
+  metadata: { id: 'request_metadata_keep' },
+  input: [
+    { type: 'message', role: 'user', status: 'completed',
+      content: [{ type: 'input_text', text: 'fixture fallback prompt', extension: { id: 'message_content_keep' } }] },
+    { type: 'web_search_call', status: 'completed',
+      action: { type: 'search', queries: ['fixture first query', 'fixture second query'],
+        sources: [{ type: 'url', url: 'https://example.invalid/fallback', id: 'source_id_keep' }],
+        extension: { id: 'search_action_keep' } },
+      extension: { id: 'search_extension_keep' } },
+    { type: 'function_call', call_id: 'call_fallback_function', name: 'fixture_lookup', status: 'completed',
+      arguments: '{"id":"argument_id_keep","encrypted_content":"argument_literal_keep"}' },
+    { type: 'function_call_output', call_id: 'call_fallback_function',
+      output: [{ type: 'input_text', text: 'fixture function result', extension: { id: 'result_id_keep' } }] },
+    { type: 'custom_tool_call', call_id: 'call_fallback_custom', name: 'fixture_custom',
+      input: '{"id":"custom_input_keep","encrypted_content":"custom_literal_keep"}' },
+    { type: 'custom_tool_call_output', call_id: 'call_fallback_custom', output: 'fixture custom result' },
+  ],
+}
+const fallbackReasoning = {
+  type: 'reasoning', encrypted_content: 'fixture fallback ciphertext',
+  summary: [{ type: 'summary_text', text: 'fixture fallback summary' }],
+}
+const fallbackHistory = {
+  ...fallbackRetainedHistory,
+  input: [
+    { ...fallbackRetainedHistory.input[0], id: 'msg_fallback' },
+    { ...fallbackReasoning, id: 'rs_fallback' },
+    { ...fallbackRetainedHistory.input[1], id: 'ws_fallback' },
+    { ...fallbackRetainedHistory.input[2], id: 'fc_fallback' },
+    { ...fallbackRetainedHistory.input[3], id: 'fco_fallback' },
+    { ...fallbackRetainedHistory.input[4], id: 'ct_fallback' },
+    { ...fallbackRetainedHistory.input[5], id: 'cto_fallback' },
+  ],
+}
+const fallbackHeaders = {
+  ...codexHeaders, originator: 'codex_cli_rs', 'session-id': 'fixture-fallback-session',
+  'thread-id': 'fixture-fallback-thread', 'x-codex-window-id': 'fixture-fallback-window',
+  'x-codex-turn-metadata': '{"turn":"fixture-fallback"}', 'x-relay-session-id': 'fixture-fallback-session',
+}
+const uncoveredHistoryError = (carrier = 'http') =>
+  historyError('fixture opaque history envelope rejected', carrier, 'fixture_uncovered_error')
+
+for (const carrier of ['http', 'json', 'sse']) {
+  test(`未覆盖错误历史安全 ${carrier}：Codex 原样确认后配套删推理和编号，保留搜索工具身份且下一请求不继承`, async t => {
+    // 只关闭独立的首发去编号，以便精确核对确认前的原始字节；保底使用默认 true。
+    const f = await fixture(t, (_, count) => count % 3 === 0 ? success : uncoveredHistoryError(carrier),
+      { PROXY_CODEX_STRIP_IDS: '0' })
+    const raw = ` \n${JSON.stringify(fallbackHistory)}\n `
+    for (let request = 0; request < 2; request++) {
+      const response = await f.request(raw, fallbackHeaders)
+      assert.equal(response.status, 200, response.body)
+      assert.equal(f.captured.length, (request + 1) * 3, '每条请求均须首发、原样确认、发送一次候选')
+      const sent = f.captured.slice(request * 3)
+      assert.equal(sent[0].raw, raw)
+      assert.equal(sent[1].raw, raw, '确认不能先去推理或搜索编号')
+      assert.deepEqual(sent[2].body, fallbackRetainedHistory,
+        '正文、搜索 action/status/扩展、嵌套 id、工具参数/结果/call_id、元数据与缓存键都保留')
+      const repairs = f.rows().filter(row => row.event === 'repair_applied')
+      assert.deepEqual(repairs.map(({ kind, removedReasoning, removedIds }) => ({ kind, removedReasoning, removedIds })),
+        Array.from({ length: request + 1 }, () => ({ kind: 'uncovered_error_fallback', removedReasoning: 1, removedIds: 6 })))
+    }
+    for (const sent of f.captured) {
+      for (const [name, value] of Object.entries(fallbackHeaders)) {
+        if (!['x-relay-client', 'x-relay-session-id'].includes(name)) assert.equal(sent.headers[name], value, `${name} 不得改写`)
+      }
+      assert.equal(sent.headers.authorization, 'Bearer fixture-only-not-a-key')
+    }
+    assert.ok(!f.rows().some(row => ['session_compat_enabled', 'session_compat_applied'].includes(row.event)),
+      '保底不登记下一请求的兼容记忆')
+  })
+}
+
+test('未覆盖错误历史安全：默认首发去编号不阻断保底，原样确认保留搜索推理配套', async t => {
+  const f = await fixture(t, (_, count) => count <= 2 ? uncoveredHistoryError() : success)
+  const response = await f.request(history, fallbackHeaders)
+  assert.equal(response.status, 200, response.body)
+  assert.deepEqual(f.captured.map(sent => sent.body), [expectedHistory, expectedHistory, recoveredHistory])
+  assert.equal(f.captured[1].raw, f.captured[0].raw)
+  assert.equal(f.rows().filter(row => row.event === 'repair_applied' && row.kind === 'uncovered_error_fallback').length, 1)
+})
+
+for (const [name, body] of [
+  ['previous_response_id', { ...fallbackHistory, previous_response_id: 'resp_server_only' }],
+  ['conversation', { ...fallbackHistory, conversation: { id: 'conv_server_only' } }],
+  ['item_reference', { ...fallbackHistory, input: [...fallbackHistory.input, { type: 'item_reference', id: 'ref_server_only' }] }],
+  ['unknown_item', { ...fallbackHistory, input: [...fallbackHistory.input, { type: 'future_tool', id: 'opaque_fixture' }] }],
+  ['compaction', { ...fallbackHistory, input: [...fallbackHistory.input, { type: 'compaction', encrypted_content: 'opaque fixture' }] }],
+  ['non_reasoning_ciphertext', { ...fallbackHistory,
+    input: [...fallbackHistory.input, { type: 'message', role: 'assistant', content: 'fixture', encrypted_content: 'opaque fixture' }] }],
+  ['missing_function_result', { ...fallbackHistory, input: fallbackHistory.input.filter(item => item.type !== 'function_call_output') }],
+  ['orphan_function_result', { ...fallbackHistory, input: fallbackHistory.input.filter(item => item.type !== 'function_call') }],
+  ['missing_custom_result', { ...fallbackHistory, input: fallbackHistory.input.filter(item => item.type !== 'custom_tool_call_output') }],
+  ['orphan_custom_result', { ...fallbackHistory, input: fallbackHistory.input.filter(item => item.type !== 'custom_tool_call') }],
+  ['nothing_removable', fallbackRetainedHistory],
+]) {
+  test(`未覆盖错误历史安全：${name} 第二次确认后拒绝且原体字节不变`, async t => {
+    const f = await fixture(t, () => uncoveredHistoryError(), { PROXY_CODEX_STRIP_IDS: '0' })
+    const raw = ` \n${JSON.stringify(body)}\n `
+    const response = await f.request(raw, fallbackHeaders)
+    assert.equal(response.status, 400, response.body)
+    assert.deepEqual(JSON.parse(response.body), uncoveredHistoryError().body, '返回当前上游错误，不伪装成限流')
+    assert.deepEqual(f.captured.map(sent => sent.raw), [raw, raw], '安全检查拒绝后不能发送部分删改的请求')
+    const rows = f.rows()
+    assert.equal(rows.filter(row => row.event === 'item_error' && row.kind === 'uncovered_error_fallback').length, 1)
+    assert.equal(rows.filter(row => row.event === 'repair_refused' && row.kind === 'uncovered_error_fallback'
+      && row.refusal === 'unsafe_inline_history').length, 1)
+    assert.ok(!rows.some(row => ['repair_applied', 'session_compat_enabled'].includes(row.event)))
+  })
+}
+
+const fallbackIdsOnlyHistory = {
+  ...fallbackRetainedHistory,
+  input: [fallbackRetainedHistory.input[0], fallbackReasoning, ...fallbackRetainedHistory.input.slice(1)],
+}
+const { status: rejectedFallbackStatus, ...fallbackMessageWithoutStatus } = fallbackHistory.input[0]
+const fallbackStatusOnlyHistory = {
+  ...fallbackHistory, input: [fallbackMessageWithoutStatus, ...fallbackHistory.input.slice(1)],
+}
+
+for (const [name, firstError, expected] of [
+  ['binding', historyError('session binding invalidated; use a new session id', 'http', 'session_binding_invalidated'), fallbackIdsOnlyHistory],
+  ['account', historyError(accountReasoningUnavailable), fallbackRetainedHistory],
+  ['history', historyError('encrypted content could not be verified'), fallbackRetainedHistory],
+  ['status', historyError("Unknown parameter: 'input[0].status'."), fallbackStatusOnlyHistory],
+]) {
+  test(`未覆盖错误历史安全：已有 ${name} 修复后连续陌生错误不得追加保底`, async t => {
+    const f = await fixture(t, (_, count) => count === 1 ? firstError
+      : count <= 3 ? uncoveredHistoryError('sse') : success, { PROXY_CODEX_STRIP_IDS: '0' })
+    const raw = ` \n${JSON.stringify(fallbackHistory)}\n `
+    const response = await f.request(raw, fallbackHeaders)
+    assert.equal(response.status, 200, response.body)
+    assert.equal(f.captured.length, 4, '两次陌生 SSE 错误沿原策略重试，不追加保底候选')
+    assert.equal(f.captured[0].raw, raw)
+    for (const sent of f.captured.slice(1)) {
+      assert.deepEqual(sent.body, expected)
+      assert.equal(sent.raw, f.captured[1].raw, '已有修复的请求体不能再被陌生错误改写')
+    }
+    const rows = f.rows()
+    assert.equal(rows.filter(row => ['repair_applied', 'status_repair_applied'].includes(row.event)).length, 1)
+    assert.ok(!rows.some(row => row.kind === 'uncovered_error_fallback'))
+  })
+}
+
+for (const carrier of ['http', 'json', 'sse']) {
+  for (const [kind, message] of [
+    ['status', "Unknown parameter: 'input[0].status'."],
+    ['account', accountReasoningUnavailable],
+    ['history', 'encrypted content could not be verified'],
+  ]) {
+    test(`未覆盖错误历史安全 ${carrier}：候选后 ${kind} 不再改体且最多两次真实发送`, async t => {
+      const f = await fixture(t, (_, count) => count <= 2 ? uncoveredHistoryError(carrier)
+        : historyError(message, carrier, `fixture_${kind}_${count}`),
+      { PROXY_CODEX_STRIP_IDS: '0', PROXY_MAX_ATTEMPTS: '12', PROXY_DEPLOY_MAX_ATTEMPTS: '20' })
+      const raw = ` \n${JSON.stringify(fallbackHistory)}\n `
+      const response = await f.request(raw, fallbackHeaders)
+      assert.equal(f.captured.length, 4, '原始两次 + 候选两次，不能使用剩余普通预算继续发送')
+      assert.equal(response.status, carrier === 'sse' ? 502 : carrier === 'json' ? 200 : 400, response.body)
+      assert.deepEqual(JSON.parse(response.body), historyError(message, 'http', `fixture_${kind}_4`).body,
+        '末次已知错误原样保留，不转入其他修复或丢失错误信息')
+      assert.equal(f.captured[0].raw, raw)
+      assert.equal(f.captured[1].raw, raw)
+      assert.deepEqual(f.captured.slice(2).map(sent => sent.body), [fallbackRetainedHistory, fallbackRetainedHistory])
+      assert.equal(f.captured[3].raw, f.captured[2].raw, '候选被冻结，连已知 status 错误也不得删除状态')
+      const rows = f.rows()
+      assert.deepEqual(rows.filter(row => row.event === 'repair_applied').map(row => row.kind), ['uncovered_error_fallback'])
+      assert.ok(!rows.some(row => ['status_repair_applied', 'session_compat_enabled'].includes(row.event)))
+    })
+  }
+}
+
 // 编辑前工作区基线包含尚未提交的账号修复；与发行基线的既有差分分开验证。
 for (const carrier of ['http', 'json', 'sse']) {
   for (const [name, message, code] of [
@@ -924,12 +1117,14 @@ for (const carrier of ['http', 'json', 'sse']) {
     ['账号推理', accountReasoningUnavailable, undefined],
     ['拒绝历史改写', 'The requested item was created under a different Azure OpenAI resource', undefined],
   ]) {
-    test(`恢复编排工作区差分 ${carrier}/${name}`, { skip: !process.env.AG_RELAY_WORKSPACE_BASELINE }, async t => {
+    test(`恢复编排工作区差分 ${carrier}/${name}${name === '未知错误' ? '（关闭保底的旧行为）' : ''}`, { skip: !process.env.AG_RELAY_WORKSPACE_BASELINE }, async t => {
       const { prompt_cache_key, ...body } = accountHistory
       if (name === '拒绝历史改写') body.previous_response_id = 'resp_fixture'
       const results = []
       for (const script of [resolve(process.env.AG_RELAY_WORKSPACE_BASELINE), core]) {
-        const f = await fixture(t, (_, count) => count <= 3 ? historyError(message, carrier, code) : success, {}, script)
+        // 旧基线不认识新字段，仅当前核心关闭保底后对照原来的未知错误行为。
+        const config = name === '未知错误' && script === core ? withoutUncoveredFallback() : {}
+        const f = await fixture(t, (_, count) => count <= 3 ? historyError(message, carrier, code) : success, config, script)
         const response = await f.request(body, claudeHeaders)
         results.push({ response, sent: f.captured.map(item => ({ raw: item.raw,
           authorization: item.headers.authorization, ua: item.headers['user-agent'], session: item.headers['session-id'] })) })

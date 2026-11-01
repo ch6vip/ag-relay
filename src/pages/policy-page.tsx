@@ -126,14 +126,14 @@ export function PolicyPage({ editor, snapshot, onAction }: {
                   <div className={`mt-2 space-y-2 ${hintClass}`}>
                     <p>指数退避（每次等待逐渐加长）到最长等待，另含小幅随机延迟，不是固定请求频率。剩余预算不足 30 秒通常不再发起新尝试，不保证试满次数。</p>
                     <p>连接、部署异常和空回应会把尝试上限至少提高到 8 次，等待 0.8 秒；定向修复也可能追加少量尝试。因此常规次数不是绝对全局上限。</p>
-                    <p>鉴权、余额或配额等确定失败不盲目重试；已经传回内容不重放，取消后不再发送。</p>
+                    <p>鉴权、余额或配额等确定失败不盲目重试；已经传回内容不重放，取消后不再发送。未覆盖错误保底不追加预算，清理后的候选请求最多实际发送 2 次。</p>
                   </div>
                 </details>
               </CardContent>
             </Card>
 
             <Card className={cardClass}>
-              <CardHeader><CardTitle><h2>历史错误怎么恢复</h2></CardTitle><CardDescription>仅累计明确的历史兼容错误：当前请求同类累计，不要求连续；不混入限流、空回应或网络错误。等待确认也会消耗尝试预算。</CardDescription></CardHeader>
+              <CardHeader><CardTitle><h2>历史错误怎么恢复</h2></CardTitle><CardDescription>仅累计明确的历史兼容错误：当前请求同类累计，不要求连续；不混入限流、空回应或网络错误。等待确认也会消耗尝试预算。未覆盖错误保底不使用此门槛，单独按原样确认一次处理。</CardDescription></CardHeader>
               <CardContent className="grid gap-3 sm:grid-cols-[minmax(0,16rem)_1fr] sm:items-center">
                 {field('historyConfirmations', '执行历史降级前，明确错误达到（次）')}
                 <p className={hintClass}>{group === 'codex' ? '可选 1–4 次。历史错误累计第 5 次停止；每请求只改写一次，报错后改写的请求最多再发 3 次，仅做会话预清理的请求按本组常规次数重试。' : '可选 1–1000 次，不能超过本组常规尝试次数。'}{profile.historyMode === 'off' ? ' 历史模块已关闭，此门槛暂不触发历史降级。' : profile.historyMode === 'always' ? ' 提前模式会先尝试安全处理，不等待此门槛。' : ''}</p>
@@ -158,6 +158,7 @@ export function PolicyPage({ editor, snapshot, onAction }: {
                         <Button variant="ghost" size="sm" disabled={disabled} aria-label={`移除${module.title}`} onClick={() => remove(module)}><XIcon className="size-3.5" />移除</Button>
                       </div>
                     </div>
+                    {module.id === 'uncoveredErrorFallback' && <p className={hintClass}>{group === 'general' ? '本组仅 Claude 参与，ZCode 不参与。' : '仅明确识别为 Codex 的请求参与。'} 关闭历史模块或改为提前处理时只暂停保底，不清空此选择。</p>}
                     <p className={hintClass}>{module.purpose}</p>
                     <p className={hintClass}><span className="text-foreground">实际影响：</span>{module.impact}</p>
                     {moduleDetails(module)}
@@ -187,6 +188,7 @@ export function PolicyPage({ editor, snapshot, onAction }: {
                 <ol className="list-decimal space-y-2 pl-5 text-xs leading-5 text-muted-foreground">
                   <li>{profile.historyMode === 'always' ? '首发先尝试整组历史兼容降级；不能安全改写就保留原始请求，并跳过相关预清理。' : `${profile.historyMode === 'on_error' && profile.rememberSession ? '未命中会话记忆时，' : ''}${profile.stripItemIds ? '首发只清理 Codex 可选编号，保留搜索依赖；尚不执行整组历史降级。' : '首发不执行额外历史剥离。'}`}</li>
                   <li>{profile.historyMode === 'off' ? '不执行历史兼容降级；会话记忆不能绕过此关闭项。' : profile.historyMode === 'always' ? '每次首发完整预处理，不读写会话记忆；历史错误确认次数不作为提前处理门槛。' : `明确历史错误达到 ${profile.historyConfirmations || '待填写'} 次，才进入错误后的历史恢复。${profile.rememberSession ? '已记住的同组会话可在首发提前复用兼容处理。' : '不读写会话兼容记忆。'}`}</li>
+                  <li>{profile.uncoveredErrorFallback ? profile.historyMode === 'on_error' ? `${group === 'general' ? '本组仅 Claude 参与，ZCode 不参与。' : '仅明确识别的 Codex 参与。'}未覆盖错误先原样确认一次，连续两次合格错误后尝试一次有损清理；候选最多实际发送 2 次，受原次数与时间预算约束，不跨请求记忆。` : '未覆盖错误保底暂不参与；仅报错后模式参与，已保留开启选择。' : '未覆盖错误保底已关闭。'}</li>
                   <li>{profile.repairStatus ? '若上游明确点名 status 错误，只修复那个状态字段。' : '不进行定向 status 修复。'}{profile.retryHistory ? '无法安全剥离时可保留历史再试。' : ''}</li>
                   {group === 'general' && <li>{profile.emptyResponseRepair ? `空回应第 ${profile.emptyResponseNormalizeAfter || '待填写'} 次起整理 id/type；${profile.emptyResponseDropReasoning ? `第 ${profile.emptyResponseReasoningAfter || '待填写'} 次起，且第一阶段确实改过，才允许省略旧推理。` : '不进入删除旧推理的第二阶段。'}` : '不执行空回应分级兼容。'}真正限流错误不会触发这两级处理。</li>}
                 </ol>

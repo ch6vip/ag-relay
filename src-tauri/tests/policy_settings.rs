@@ -36,6 +36,7 @@ fn 启动环境_显式添加完整策略快照且保持旧环境默认表() {
     let mut policy = PolicySettings::default();
     policy.profiles.codex.max_attempts = 17;
     policy.profiles.general.base_delay_ms = 333;
+    policy.profiles.general.uncovered_error_fallback = false;
     let mut next =
         gateway_env::gateway_env_pairs_with_policy(&diagnostics, &connection, &policy).unwrap();
     let index = next
@@ -277,6 +278,70 @@ fn 保存策略_重开后保留值且不修改连接文件() {
 }
 
 #[test]
+fn 未覆盖错误保底_仅磁盘读取补缺字段且保留显式关闭() {
+    use ag_relay_lib::policy_settings::PolicySettings;
+    let fixture = Fixture::new("fallback-migration");
+    let path = fixture.0.join("policy-settings.json");
+    for group in ["codex", "general"] {
+        let mut expected = PolicySettings::default();
+        expected.profiles.codex.uncovered_error_fallback = false;
+        expected.profiles.general.uncovered_error_fallback = false;
+        let mut old = serde_json::to_value(&expected).unwrap();
+        old["profiles"][group]
+            .as_object_mut()
+            .unwrap()
+            .remove("uncoveredErrorFallback");
+        assert!(serde_json::from_value::<PolicySettings>(old.clone()).is_err(),
+            "严格 DTO 不能补默认冒充生效：{group}");
+        let source = serde_json::to_vec(&old).unwrap();
+        std::fs::write(&path, &source).unwrap();
+        if group == "codex" {
+            expected.profiles.codex.uncovered_error_fallback = true;
+        } else {
+            expected.profiles.general.uncovered_error_fallback = true;
+        }
+        assert_eq!(fixture.store().load().unwrap(), expected);
+        assert_eq!(std::fs::read(&path).unwrap(), source, "迁移不写回旧配置");
+    }
+}
+
+#[test]
+fn 未覆盖错误保底_错误类型不可迁移或反序列化() {
+    use ag_relay_lib::policy_settings::PolicySettings;
+    use serde_json::json;
+    let fixture = Fixture::new("fallback-types");
+    let path = fixture.0.join("policy-settings.json");
+    for group in ["codex", "general"] {
+        for invalid in [json!(null), json!("false"), json!(0), json!([]), json!({})] {
+            let mut value = serde_json::to_value(PolicySettings::default()).unwrap();
+            value["profiles"][group]["uncoveredErrorFallback"] = invalid;
+            assert!(serde_json::from_value::<PolicySettings>(value.clone()).is_err());
+            let source = serde_json::to_vec(&value).unwrap();
+            std::fs::write(&path, &source).unwrap();
+            assert!(fixture.store().load().is_err(), "应拒绝 {value}");
+            assert_eq!(std::fs::read(&path).unwrap(), source);
+        }
+    }
+}
+
+#[test]
+fn 未覆盖错误保底_所有历史模式均保存并回读原选择() {
+    use ag_relay_lib::policy_settings::{HistoryMode, PolicySettings};
+    let fixture = Fixture::new("fallback-modes");
+    for mode in [HistoryMode::Off, HistoryMode::Always, HistoryMode::OnError] {
+        for enabled in [true, false] {
+            let mut settings = PolicySettings::default();
+            for profile in [&mut settings.profiles.codex, &mut settings.profiles.general] {
+                profile.history_mode = mode;
+                profile.uncovered_error_fallback = enabled;
+            }
+            assert_eq!(fixture.store().save(&settings).unwrap(), settings);
+            assert_eq!(fixture.store().load().unwrap(), settings, "模式暂停不清空选择");
+        }
+    }
+}
+
+#[test]
 fn 当前版本缺字段_只补对应分组默认且不写回文件() {
     let fixture = Fixture::new("partial");
     let source = r#"{"schemaVersion":1,"profiles":{"codex":{"maxAttempts":9},"general":{"historyMode":"off"}}}"#;
@@ -289,6 +354,8 @@ fn 当前版本缺字段_只补对应分组默认且不写回文件() {
     assert!(!loaded.profiles.general.strip_item_ids);
     assert!(loaded.profiles.general.empty_response_repair);
     assert!(loaded.profiles.general.remember_session);
+    assert!(loaded.profiles.codex.uncovered_error_fallback);
+    assert!(loaded.profiles.general.uncovered_error_fallback);
     assert_eq!(
         serde_json::to_value(&loaded).unwrap()["profiles"]["general"]["historyMode"],
         "off"
@@ -315,6 +382,7 @@ fn 策略缺失_只读返回分组默认且不创建文件() {
         assert_eq!(profile["connectTimeoutMs"], 220000);
         assert_eq!(profile["historyMode"], "on_error");
         assert_eq!(profile["historyConfirmations"], 1);
+        assert_eq!(profile["uncoveredErrorFallback"], true);
         assert_eq!(profile["rememberSession"], true);
         assert_eq!(profile["repairStatus"], true);
         assert_eq!(profile["stripItemIds"], group == "codex");

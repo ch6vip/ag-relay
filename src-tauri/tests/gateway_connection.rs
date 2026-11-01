@@ -652,6 +652,39 @@ fn 策略保存_不重启_安全重启后才由核心确认完整生效() {
 }
 
 #[test]
+fn 未覆盖错误保底_仅新字段变化需重启且生效回读保留关闭() {
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", upstream.local_addr().unwrap().port());
+    let port = free_port();
+    let mut fixture = Fixture::with_policy("fallback-apply", &url, port);
+    fixture.gateway.start().unwrap();
+    for codex in [true, false] {
+        let original = fixture.gateway.policy_settings().unwrap();
+        let original_pid = fixture.gateway.managed_supervisor_pid();
+        assert!(original.active_supported);
+        assert_eq!(original.active.as_ref(), Some(&original.saved));
+        assert!(!original.restart_required);
+        let mut changed = original.saved.clone();
+        let profile = if codex { &mut changed.profiles.codex } else { &mut changed.profiles.general };
+        assert!(profile.uncovered_error_fallback);
+        profile.uncovered_error_fallback = false;
+        let saved = fixture.gateway.save_policy(&changed).unwrap();
+        assert_eq!(saved.saved, changed);
+        assert_eq!(saved.active, original.active);
+        assert_eq!(saved.active_revision, original.active_revision);
+        assert!(saved.restart_required, "仅新开关不同也需重启，codex={codex}");
+        assert_eq!(fixture.gateway.managed_supervisor_pid(), original_pid);
+        assert_eq!(fixture.gateway.policy_settings().unwrap().saved, changed);
+        assert!(fixture.gateway.restart(Duration::from_secs(3)).unwrap());
+        let applied = fixture.gateway.policy_settings().unwrap();
+        assert_eq!(applied.active, Some(changed));
+        assert!(applied.active_supported);
+        assert!(!applied.restart_required);
+        assert_ne!(applied.active_revision, original.active_revision);
+    }
+}
+
+#[test]
 fn 策略重启_排空期间磁盘变化不能替换已确认的启动快照() {
     use std::sync::mpsc;
     let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -737,6 +770,8 @@ fn 策略实况_只接受已核实核心的完整有效回执() {
         "/pid",
         "/policy/revision",
         "/policy/settings/profiles/codex/maxAttempts",
+        "/policy/settings/profiles/codex/uncoveredErrorFallback",
+        "/policy/settings/profiles/general/uncoveredErrorFallback",
     ] {
         let mut missing = complete.clone();
         let (parent, key) = pointer.rsplit_once('/').unwrap();
@@ -766,6 +801,8 @@ fn 策略实况_只接受已核实核心的完整有效回执() {
             json!("future_mode"),
         ),
         ("/policy/settings/profiles/general/baseDelayMs", json!(0)),
+        ("/policy/settings/profiles/codex/uncoveredErrorFallback", json!("true")),
+        ("/policy/settings/profiles/general/uncoveredErrorFallback", json!(null)),
     ] {
         let mut invalid = complete.clone();
         *invalid.pointer_mut(pointer).unwrap() = value;

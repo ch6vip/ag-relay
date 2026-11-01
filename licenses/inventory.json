@@ -1,27 +1,27 @@
 {
   "schemaVersion": 1,
   "target": "x86_64-pc-windows-msvc",
-  "verifiedAt": "2026-10-31",
+  "verifiedAt": "2026-11-02",
   "scope": "锁定安装的 npm 完整依赖树（含开发工具）、Windows cargo metadata 已解析依赖树（含构建/宏）、随包 Node、Rust 标准库和 WebView2Loader SDK。其他平台 npm 可选二进制单列排除；并非精确二进制 SBOM。",
   "inputs": [
     {
       "path": "package.json",
-      "sha256": "7146a800f290b3cf576ac1c0b7559f1d57b21baf878a1488e44e6a8bbd86b228",
+      "sha256": "3acab771ef6802baaeb8fa2f39d04ec494e3bd0a8c00918576bb097952e82e84",
       "normalizeLf": true
     },
     {
       "path": "package-lock.json",
-      "sha256": "7d985b52f2064aa54ebc3e0c3b694f6b2dd954fdfb4c151d2706c680b4e59a22",
+      "sha256": "c59c13baf3931da90f1e362c7ee2a5f9ff60418441223ec3c813b66dbcf0aef6",
       "normalizeLf": true
     },
     {
       "path": "src-tauri/Cargo.lock",
-      "sha256": "88f9f861b64aa1e772456cc3e213c627c727c47f3cfa21db4536ec4ec4c31f4a",
+      "sha256": "cf6db4f04e335098ef7e03c3fc9797ce69deeaddd29cd7544184630b796d37d1",
       "normalizeLf": true
     },
     {
       "path": "src-tauri/Cargo.toml",
-      "sha256": "afdf3c5e4f7c41f594ea357d2c3d767ce6c7126f5c3af23fcc435c568a6d2d3f",
+      "sha256": "6f358275826064b93daca2ff0ebfa35b15cf3bf29ca42bfce677cb4df9059689",
       "normalizeLf": true
     },
     {
@@ -41,7 +41,7 @@
         "normalizeLf": true
       }
     ],
-    "review": "两套完整安装器源码归档及 inventory.json/COMPONENTS.md 由每次发布的同版来源附件提供，其他许可材料继续随安装包提供。2026-10-16 新增 Windows 依赖 tauri-plugin-single-instance 2.5.4 与 tracing-attributes 0.1.31，已补齐原文与组件索引并刷新依赖输入指纹；修正单实例组件的 MIT 原文链接。2026-10-17 产品版本改为 0.3.9；已逐项确认四份清单仅产品版本变化，295 项 Windows Rust 解析依赖、422 个已安装 npm 包及锁定树中 74 个排除的平台包均与许可记录一致，仅刷新四份清单输入指纹，随包 Node 和第三方依赖未变。 2026-10-30 v0.3.16：295 项 Windows Rust 解析依赖与496项npm锁定包（含74项排除平台包）逐项核对未变；Rust工具链实测1.99.1，其固定提交两份根许可与随工具链标准库版权原文均与已有材料逐字节相同，更新来源版本与输入指纹。 2026-10-31 v0.3.17：295 项 Windows Rust 解析依赖与496项npm锁定包（含74项排除平台包）逐项核对未变；Rust工具链实测1.99.1、随包Node与全部许可原文未变，仅刷新四份清单输入指纹。 2026-11-01 v0.3.18：仅网关核心重试策略与版本号变化；295 项 Windows Rust 解析依赖与 npm 锁定树未变。本机稳定工具链实测 1.99.0（提交 b940084d7），随包标准库 COPYRIGHT-library.html 与既有材料逐字节相同，故按实测版本更新工具链来源记录并刷新四份输入指纹。"
+    "review": "两套完整安装器源码归档及 inventory.json/COMPONENTS.md 由每次发布的同版来源附件提供，其他许可材料继续随安装包提供。2026-10-16 新增 Windows 依赖 tauri-plugin-single-instance 2.5.4 与 tracing-attributes 0.1.31，已补齐原文与组件索引并刷新依赖输入指纹；修正单实例组件的 MIT 原文链接。2026-10-17 产品版本改为 0.3.9；已逐项确认四份清单仅产品版本变化，295 项 Windows Rust 解析依赖、422 个已安装 npm 包及锁定树中 74 个排除的平台包均与许可记录一致，仅刷新四份清单输入指纹，随包 Node 和第三方依赖未变。 2026-10-30 v0.3.16：295 项 Windows Rust 解析依赖与496项npm锁定包（含74项排除平台包）逐项核对未变；Rust工具链实测1.99.1，其固定提交两份根许可与随工具链标准库版权原文均与已有材料逐字节相同，更新来源版本与输入指纹。 2026-10-31 v0.3.17：295 项 Windows Rust 解析依赖与496项npm锁定包（含74项排除平台包）逐项核对未变；Rust工具链实测1.99.1、随包Node与全部许可原文未变，仅刷新四份清单输入指纹。 2026-11-01 v0.3.18：仅网关核心重试策略与版本号变化；295 项 Windows Rust 解析依赖与 npm 锁定树未变。本机稳定工具链实测 1.99.0（提交 b940084d7），随包标准库 COPYRIGHT-library.html 与既有材料逐字节相同，故按实测版本更新工具链来源记录并刷新四份输入指纹。 2026-11-02 v0.3.20：新增Claude/Codex未覆盖错误保底；496项npm锁定包与295项Windows Rust解析依赖逐项匹配许可清单，四份清单仅产品版本号变化；Rust实测1.99.1及许可原文、随包Node不变，刷新四份文本输入指纹。"
   },
   "components": [
     {

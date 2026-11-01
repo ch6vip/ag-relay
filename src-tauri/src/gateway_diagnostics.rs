@@ -194,6 +194,9 @@ fn explain(event: &str, title: &str, r: &Value, fallback: &str) -> (String, Stri
         }),
         "client_closed" => ("客户端提前断开", "客户端在回复完成前断开，可能是主动取消、超时或关闭了连接。".into()),
         "precommit_failure" => ("尚未收到可用回复", format!("回复交付前遇到问题：{}。是否继续尝试，请查看后续记录。", field_cn(r, "kind").unwrap_or_else(|| "原因未知".into()))),
+        "item_error" if r.get("kind").and_then(Value::as_str) == Some("uncovered_error_fallback") => ("未覆盖错误保底", "原样确认后仍收到未覆盖错误，网关正在判断能否对本次历史做一次安全清理；尚未确认错误由历史引起。".into()),
+        "repair_applied" if r.get("kind").and_then(Value::as_str) == Some("uncovered_error_fallback") => ("已执行未覆盖错误保底", "本次转发副本已做一次有损清理，可能损失旧推理连续性；不跨请求记忆，是否恢复仍需查看后续结果。".into()),
+        "repair_refused" if r.get("kind").and_then(Value::as_str) == Some("uncovered_error_fallback") => ("未覆盖错误保底已停止", format!("未覆盖错误保底已停止：{}。保留本次错误，不跨请求记忆。", field_cn(r, "refusal").unwrap_or_else(|| "原因未知".into()))),
         "item_error" => ("请求中的历史内容不被上游接受", "上游无法使用部分历史内容，网关正在判断能否兼容处理。".into()),
         "session_compat_refused" | "repair_refused" => ("无法安全自动修复", "继续修改可能损失历史内容，网关没有强行修复。可在客户端检查会话内容。".into()),
         "status_repair_refused" => ("无法自动调整请求格式", "当前请求不符合安全修复条件，未执行这项修改。具体原因见技术信息。".into()),
@@ -377,11 +380,12 @@ const SUB_LABELS: &[(&str, &str, &str)] = &[
     ("source", "json_empty", "空回应（HTTP 200）"),
     ("source", "explicit_session", "显式会话"),
     ("source", "resource_lineage", "资源血缘"),
-    // kind（11）—— item 3 + peek 6 + 空回应形状 2（§2.B）
+    // kind（13）—— 历史错误与保底 5 + 下发前失败 6 + 空回应形状 2（§2.B）
     ("kind", "azure_resource_mismatch", "跨 Azure 资源引用"),
     ("kind", "stale_reasoning_item", "失效的 reasoning 项"),
     ("kind", "session_binding_invalidated", "会话绑定失效（仅清历史编号）"),
     ("kind", "account_reasoning_unavailable", "账号绑定的旧推理不可用"),
+    ("kind", "uncovered_error_fallback", "未覆盖错误保底"),
     ("kind", "other", "其他"),
     ("kind", "peek_timeout", "等待首个内容超时"),
     ("kind", "empty_stream_drop", "上游静默丢弃（空流）"),
@@ -785,9 +789,9 @@ mod tests {
         "http_error", "sse_precommit", "json_error", "json_empty",
         "explicit_session", "resource_lineage",
     ];
-    const EXPECTED_KIND: [&str; 12] = [
+    const EXPECTED_KIND: [&str; 13] = [
         "azure_resource_mismatch", "stale_reasoning_item", "session_binding_invalidated",
-        "account_reasoning_unavailable", "other", "peek_timeout",
+        "account_reasoning_unavailable", "uncovered_error_fallback", "other", "peek_timeout",
         "empty_stream_drop", "read_timeout", "buffer_limit", "stream_error",
         "empty_stream_shape", "empty_stream_reasoning",
     ];
@@ -987,7 +991,7 @@ mod tests {
         assert!(active_events.is_disjoint(&legacy_events));
 
         for (labels, groups, count) in [
-            (SUB_LABELS, EXPECTED_ACTIVE_SUB_ENUMS, 80),
+            (SUB_LABELS, EXPECTED_ACTIVE_SUB_ENUMS, 81),
             (LEGACY_SUB_LABELS, EXPECTED_LEGACY_SUB_ENUMS, 4),
         ] {
             let actual: BTreeSet<_> = labels.iter().map(|row| (row.0, row.1)).collect();
@@ -1000,7 +1004,7 @@ mod tests {
         }
         assert!(SUB_LABELS.iter().all(|row| !LEGACY_SUB_LABELS.iter()
             .any(|old| old.0 == row.0 && old.1 == row.1)), "当前与历史枚举不能重复");
-        assert_eq!(EVENT_BASE.len() + LEGACY_EVENT_BASE.len() + SUB_LABELS.len() + LEGACY_SUB_LABELS.len(), 109);
+        assert_eq!(EVENT_BASE.len() + LEGACY_EVENT_BASE.len() + SUB_LABELS.len() + LEGACY_SUB_LABELS.len(), 110);
     }
 
     #[test]
@@ -1273,7 +1277,51 @@ mod tests {
         assert!(event.technical_detail.contains("账号绑定的旧推理不可用"));
     }
 
-    /// 样本未触发的 7 个事件（手造最小记录，字段形状照 diagnostics-codes.md §1/§2）。
+    #[test]
+    fn 未覆盖错误保底样本_复用三事件及既有拒绝原因且不冒充归因() {
+        use ActivityLevel::*;
+        let recs = load_fixture();
+        let samples: Vec<_> = recs.iter()
+            .filter(|record| record["kind"] == "uncovered_error_fallback")
+            .collect();
+        assert_eq!(samples.len(), 5);
+        let expected = [
+            ("item_error", Warn, None),
+            ("repair_applied", Info, None),
+            ("repair_refused", Warn, Some("repair_exhausted")),
+            ("repair_refused", Warn, Some("unsafe_inline_history")),
+            ("repair_refused", Warn, Some("time_budget")),
+        ];
+        for (record, (code, level, refusal)) in samples.iter().zip(expected) {
+            let event = localize_record(record).unwrap();
+            assert_eq!(event.code, code);
+            assert_eq!(event.level, level);
+            assert!(event.title.contains("未覆盖错误保底"));
+            assert!(event.technical_detail.contains("未覆盖错误保底"));
+            assert!(!event.technical_detail.contains("原始码"));
+            assert_eq!(event.attempt, record["attempt"].as_u64());
+            assert_eq!(record["refusal"].as_str(), refusal);
+            if let Some(refusal) = refusal {
+                let label = sub_label("refusal", refusal).unwrap();
+                assert_eq!(event.summary, label);
+                assert!(event.detail.contains(label));
+                assert!(event.technical_detail.contains(label));
+            }
+        }
+        let identified = localize_record(samples[0]).unwrap();
+        let applied = localize_record(samples[1]).unwrap();
+        let exhausted = localize_record(samples[2]).unwrap();
+        assert_eq!(identified.summary, "未覆盖错误保底");
+        assert!(identified.detail.contains("尚未确认错误由历史引起"));
+        assert!(applied.detail.contains("可能损失旧推理连续性"));
+        assert!(applied.detail.contains("不跨请求记忆"));
+        assert_eq!(identified.request_id, applied.request_id);
+        assert_eq!(applied.request_id, exhausted.request_id);
+        assert_eq!(applied.attempt, Some(2));
+        assert_eq!(exhausted.attempt, Some(4));
+    }
+
+    /// 额外事件形状（手造最小记录，字段形状照 diagnostics-codes.md §1/§2）。
     #[test]
     fn 未采样事件_手造记录_译文级别正确() {
         use ActivityLevel::*;
@@ -1305,7 +1353,7 @@ mod tests {
         let r = base(json!({"time":"t","event":"status_repair_applied","source":"http_error","status":400,"index":3}));
         assert_eq!(r.level, Info);
 
-        // repair_applied（样本里从未触发）：空回应形状修复
+        // repair_applied：补充空回应形状修复，与保底样本区分。
         let r = base(json!({"time":"t","event":"repair_applied","kind":"empty_stream_shape","source":"json_empty","status":200,"removedIds":4}));
         assert_eq!(r.level, Info);
         assert!(r.technical_detail.contains("空回应形状修复"), "{}", r.technical_detail);

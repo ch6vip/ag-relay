@@ -2,8 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { createPolicyEditor, getPolicySettings, savePolicySettings } from '../src/lib/policy-settings.ts'
+import type { PolicySettings } from '../src/lib/types.ts'
 
-const defaults = JSON.parse(readFileSync(new URL('./fixtures/policy-settings.json', import.meta.url), 'utf8'))
+const defaults: PolicySettings = JSON.parse(readFileSync(new URL('./fixtures/policy-settings.json', import.meta.url), 'utf8'))
 
 test('策略可通过桌面命令保存并回读，保存不重启正在运行的网关', async () => {
   let saved = structuredClone(defaults)
@@ -131,5 +132,80 @@ test('秒输入精确换算整数毫秒，留空或更细小数不能保存', as
     assert.match(editor.getSnapshot().validation ?? '', /整数毫秒/)
     editor.editProfile('codex', { baseDelayMs: '' })
     assert.match(editor.getSnapshot().validation ?? '', /等待/)
+  } finally { Reflect.deleteProperty(globalThis, '__TAURI__') }
+})
+
+test('未覆盖错误保底独立保存并回读，只有新开关不同也保留待重启回执', async () => {
+  let saved = structuredClone(defaults)
+  const commands: string[] = []
+  const view = () => ({ defaults, saved, active: defaults, activeRevision: 'fixture-baseline', restartRequired: JSON.stringify(saved) !== JSON.stringify(defaults), activeSupported: true })
+  Object.assign(globalThis, { __TAURI__: { core: { invoke: async (command: string, args?: { settings: PolicySettings }) => {
+    commands.push(command)
+    if (command === 'save_policy_settings') saved = structuredClone(args!.settings)
+    else assert.equal(command, 'get_policy_settings', '保存不能重启网关')
+    return structuredClone(view())
+  } } } })
+  try {
+    for (const group of ['codex', 'general'] as const) {
+      const next = structuredClone(defaults)
+      next.profiles[group].uncoveredErrorFallback = false
+      const result = await savePolicySettings(next)
+      assert.equal(result.restartRequired, true)
+      assert.equal(result.active?.profiles[group].uncoveredErrorFallback, true)
+      assert.deepEqual(result.saved, next)
+      assert.deepEqual((await getPolicySettings()).saved, next)
+    }
+    assert.deepEqual(commands, ['save_policy_settings', 'get_policy_settings', 'save_policy_settings', 'get_policy_settings'])
+  } finally { Reflect.deleteProperty(globalThis, '__TAURI__') }
+})
+
+test('未覆盖错误保底必须为布尔值，缺失或错类型在调用保存前拒绝', async () => {
+  let writes = 0
+  Object.assign(globalThis, { __TAURI__: { core: { invoke: async () => { writes++; throw new Error('不应调用后端') } } } })
+  try {
+    for (const group of ['codex', 'general'] as const) {
+      for (const value of [null, 'false', 0, [], {}, undefined]) {
+        const next = structuredClone(defaults)
+        if (value === undefined) Reflect.deleteProperty(next.profiles[group], 'uncoveredErrorFallback')
+        else Object.assign(next.profiles[group], { uncoveredErrorFallback: value })
+        await assert.rejects(() => savePolicySettings(next), /模块开关无效：uncoveredErrorFallback/)
+      }
+    }
+    assert.equal(writes, 0)
+  } finally { Reflect.deleteProperty(globalThis, '__TAURI__') }
+})
+
+test('历史模式暂停保底但保留选择，恢复默认取后端而非前端副本', async () => {
+  const backend = { defaults: structuredClone(defaults), saved: structuredClone(defaults), active: null, activeRevision: null, restartRequired: false, activeSupported: false }
+  backend.defaults.profiles.codex.uncoveredErrorFallback = false
+  Object.assign(globalThis, { __TAURI__: { core: { invoke: async (command: string, args?: { settings: PolicySettings }) => {
+    if (command === 'save_policy_settings') backend.saved = structuredClone(args!.settings)
+    else assert.equal(command, 'get_policy_settings')
+    return structuredClone(backend)
+  } } } })
+  try {
+    const editor = createPolicyEditor()
+    await editor.refresh()
+    for (const group of ['codex', 'general'] as const) {
+      for (const enabled of [true, false]) {
+        editor.editProfile(group, { uncoveredErrorFallback: enabled })
+        for (const historyMode of ['off', 'always', 'on_error'] as const) {
+          editor.editProfile(group, { historyMode })
+          assert.equal(editor.getSnapshot().validation, null)
+          await editor.save()
+          await editor.refresh()
+          assert.equal(editor.getSnapshot().draft?.profiles[group].uncoveredErrorFallback, enabled)
+          assert.equal(editor.getSnapshot().draft?.profiles[group].historyMode, historyMode)
+          assert.equal(backend.saved.profiles[group].uncoveredErrorFallback, enabled)
+        }
+      }
+    }
+    editor.editProfile('codex', { uncoveredErrorFallback: true })
+    editor.reset('codex')
+    assert.equal(editor.getSnapshot().draft?.profiles.codex.uncoveredErrorFallback, false)
+    assert.equal(editor.getSnapshot().draft?.profiles.general.uncoveredErrorFallback, false)
+    editor.reset()
+    assert.equal(editor.getSnapshot().draft?.profiles.general.uncoveredErrorFallback, true)
+    assert.equal(backend.saved.profiles.general.uncoveredErrorFallback, false, '恢复默认不能先保存')
   } finally { Reflect.deleteProperty(globalThis, '__TAURI__') }
 })

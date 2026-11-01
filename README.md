@@ -172,7 +172,28 @@ node scripts/release.mjs test-build --out C:\Temp\ag-relay-test-artifacts
 
 注：网关核心的四个 `.mjs` 与 `gateway-config.bat` 已由 `.gitattributes` 固定为不做换行符转换（`-text`），因此任何机器上检出内容与仓库内容一致、哈希唯一。此前 `.bat` 未固定：仓库内容为 LF、Windows 检出为 CRLF，两者哈希不同。下表 v0.2.0/v0.3.1 条目记录的是当时**磁盘检出**（CRLF）的值 `102865c8…`，属历史留档不回填；v0.3.2 及以后记录的是**仓库内容**（LF）的值 `9a8a483e…`。
 
-### v0.3.17（当前）
+### v0.3.18（当前）
+
+| 项 | 值 |
+| --- | --- |
+| 打包日期 | 2026-11-01 15:59（UTC+8） |
+| 发布日期 | 2026-11-01 17:02（UTC+8） |
+| 本仓构建提交 | `245b0a9`（tag `v0.3.18`；构建输入已提交，未混入本地 `.gitignore` 改动与研究记录或诊断脚本） |
+| 构建方式 | 维护者本机，原生产更新签名；不运行安装器 |
+| 验证 | 策略测试 175 项、历史测试 133 项（含新旧核心 Claude 差分）、发布工具 44 项通过，无失败或跳过；许可 726 个组件通过；正式预检、两种安装器验签、版本绑定、许可与产物路径检查通过；7 个远端文件摘要与本地一致；匿名 latest 清单返回 0.3.18；未安装或重启现用网关 |
+| `relay-retry-proxy.mjs` sha256 | `1ddef0b62d2c48eb854866100bf195cee81173e9b4c9e72a05fada0523a2586a` |
+| `relay-supervisor.mjs` sha256 | `f2f030b46999f84afc77f7f92643075c1d1f1ddf7ad3c327fbd92f5593dff77c` |
+| `relay-start-check.mjs` sha256 | `bb54cc7255b4f570ba1bdcfda255f19f0ca0a70fa6d028d0ed4e44f8146037c4` |
+| `bounded-file-log.mjs` sha256 | `3841b877ce76e6ff37497bfbcd65e3dd4f478442dc7fff9eaf4b39612b25c205` |
+| `gateway-config.bat` sha256 | `5eff32b941b63708fa64104f09d7e28e15ff8dd569a49dc5c9d40bb1859b84f7` |
+| `ag-relay_0.3.18_x64-setup.exe` sha256 | `a6dcc5fce474d7d6f2f0f56fe9d9e413f5458c016823f6aa254e89b6614a9814` |
+| `ag-relay_0.3.18_x64_zh-CN.msi` sha256 | `74f37f7a7a3bfde6e978eec1a76885184c3af21ff2701f470ef8aba445e8d03a` |
+| `third-party-sources.tar.gz` sha256 | `f6c5021dc62443134924449335af7d415ca37cc9e11f087e2267eb344e942404` |
+| Release | [v0.3.18](https://github.com/xinxinxiaoxin/ag-relay/releases/tag/v0.3.18)（NSIS + MSI + 各自 `.sig` + `latest.json` + `SHA256SUMS` + 第三方源码附件） |
+
+Claude 与 Codex 连续两次收到同一明确限流后，仅更换一次 `prompt_cache_key`，不改历史、会话身份、重试次数与预算；成功的新键跨请求复用，失败不登记。ZCode、未知客户端和无缓存键请求保持原行为。说明见 [v0.3.18](docs/releases/v0.3.18.md)，详情见 [重试与取消边界](docs/retry-boundaries.md#cache-route-recovery)。
+
+### v0.3.17（历史）
 
 | 项 | 值 |
 | --- | --- |

@@ -1,6 +1,6 @@
 [package]
 name = "ag-relay"
-version = "0.3.17"
+version = "0.3.18"
 description = "AG Relay · 本地重试网关（自带核心与桌面面板）"
 edition = "2021"
 

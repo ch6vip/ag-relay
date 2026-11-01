@@ -172,7 +172,28 @@ node scripts/release.mjs test-build --out C:\Temp\ag-relay-test-artifacts
 
 注：网关核心的四个 `.mjs` 与 `gateway-config.bat` 已由 `.gitattributes` 固定为不做换行符转换（`-text`），因此任何机器上检出内容与仓库内容一致、哈希唯一。此前 `.bat` 未固定：仓库内容为 LF、Windows 检出为 CRLF，两者哈希不同。下表 v0.2.0/v0.3.1 条目记录的是当时**磁盘检出**（CRLF）的值 `102865c8…`，属历史留档不回填；v0.3.2 及以后记录的是**仓库内容**（LF）的值 `9a8a483e…`。
 
-### v0.3.18（当前）
+### v0.3.19（当前）
+
+| 项 | 值 |
+| --- | --- |
+| 打包日期 | 2026-11-01 21:55（UTC+8） |
+| 发布日期 | 2026-11-01 22:03（UTC+8） |
+| 本仓构建提交 | `04182fc`（tag `v0.3.19`；构建输入已提交并推送，未混入本地 `.tmp` 临时目录） |
+| 构建方式 | 维护者本机，原生产更新签名；不运行安装器 |
+| 验证 | 网关核心隔离回归 356 项（含编辑前工作区差分与发布基线差分）、诊断 24 项、请求进展组件 10 项、发布工具 44 项通过，无失败或跳过；许可 726 个组件通过；正式预检、两种安装器验签、版本绑定、许可与产物路径检查通过；7 个远端文件摘要与本地一致；匿名 latest 清单返回 0.3.19；未安装或重启现用网关 |
+| `relay-retry-proxy.mjs` sha256 | `d9fa9b34cc6621e43b772b523fb0e497986cead4b7f7bfcdddbb19ee7989ec81` |
+| `relay-supervisor.mjs` sha256 | `f2f030b46999f84afc77f7f92643075c1d1f1ddf7ad3c327fbd92f5593dff77c` |
+| `relay-start-check.mjs` sha256 | `bb54cc7255b4f570ba1bdcfda255f19f0ca0a70fa6d028d0ed4e44f8146037c4` |
+| `bounded-file-log.mjs` sha256 | `3841b877ce76e6ff37497bfbcd65e3dd4f478442dc7fff9eaf4b39612b25c205` |
+| `gateway-config.bat` sha256 | `5eff32b941b63708fa64104f09d7e28e15ff8dd569a49dc5c9d40bb1859b84f7` |
+| `ag-relay_0.3.19_x64-setup.exe` sha256 | `aab62f402de00d3cd2d362e32df47434eedf542aa9b82c8200c7f10d58be1ccf` |
+| `ag-relay_0.3.19_x64_zh-CN.msi` sha256 | `760f9b8806b5a57b5557cdc7bce7a579fb17b459f82ab9226acefd6f24d9e669` |
+| `third-party-sources.tar.gz` sha256 | `1e8c817183d8755fad13f2038592c2d8182e46f2c1490277627c87146bafb8b4` |
+| Release | [v0.3.19](https://github.com/xinxinxiaoxin/ag-relay/releases/tag/v0.3.19)（NSIS + MSI + 各自 `.sig` + `latest.json` + `SHA256SUMS` + 第三方源码附件） |
+
+**删除自动换键**：v0.3.18 的缓存键切换策略已移除。客户端提供的 `prompt_cache_key` 原值转发，未提供时不新增；限流只按既有预算重试，不修改请求内容。只读诊断改为每请求一条 `request_summary`，旧 `cache_route_summary` 仅保留历史读取；请求进展新增“等待重试”阶段。说明见 [v0.3.19](docs/releases/v0.3.19.md)，现行边界见 [重试与取消边界](docs/retry-boundaries.md#cache-key-preservation)。
+
+### v0.3.18（历史）
 
 | 项 | 值 |
 | --- | --- |

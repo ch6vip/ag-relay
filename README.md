@@ -173,7 +173,28 @@ node scripts/release.mjs test-build --out C:\Temp\ag-relay-test-artifacts
 
 注：网关核心的四个 `.mjs` 与 `gateway-config.bat` 已由 `.gitattributes` 固定为不做换行符转换（`-text`），因此任何机器上检出内容与仓库内容一致、哈希唯一。此前 `.bat` 未固定：仓库内容为 LF、Windows 检出为 CRLF，两者哈希不同。下表 v0.2.0/v0.3.1 条目记录的是当时**磁盘检出**（CRLF）的值 `102865c8…`，属历史留档不回填；v0.3.2 及以后记录的是**仓库内容**（LF）的值 `9a8a483e…`。
 
-### v0.3.19（当前）
+### v0.3.20（当前）
+
+| 项 | 值 |
+| --- | --- |
+| 打包日期 | 2026-11-02 00:37（UTC+8） |
+| 发布日期 | 2026-11-02 00:43（UTC+8） |
+| 本仓构建提交 | `ca0cd90429b0b9b93103891f0e02aae3b7fddeb6`（tag `v0.3.20`；构建输入已提交并推送） |
+| 构建方式 | 维护者本机，原生产更新签名；不运行安装器 |
+| 验证 | Node 493 项首轮492通过、1项旧绑定用例超时取消；该项单独及37项绑定邻组复验通过，未放宽断言或超时。Rust诊断25项、设置14项、策略回执5项及新开关生效1项通过；前端9项、类型检查和全假IPC浏览器交互通过。496项npm锁定包及295项Windows Rust解析依赖与清单一致，726项许可通过；正式预检、两种安装器验签、版本绑定及产物路径检查通过；7份远端摘要与本地一致；匿名latest返回0.3.20；未安装或重启现用网关 |
+| `relay-retry-proxy.mjs` sha256 | `54251c62cb372b89f7378428fed72e24c68fe5c7d145fceaad8cd59d76fe6f1f` |
+| `relay-supervisor.mjs` sha256 | `f2f030b46999f84afc77f7f92643075c1d1f1ddf7ad3c327fbd92f5593dff77c` |
+| `relay-start-check.mjs` sha256 | `bb54cc7255b4f570ba1bdcfda255f19f0ca0a70fa6d028d0ed4e44f8146037c4` |
+| `bounded-file-log.mjs` sha256 | `3841b877ce76e6ff37497bfbcd65e3dd4f478442dc7fff9eaf4b39612b25c205` |
+| `gateway-config.bat` sha256 | `5eff32b941b63708fa64104f09d7e28e15ff8dd569a49dc5c9d40bb1859b84f7` |
+| `ag-relay_0.3.20_x64-setup.exe` sha256 | `4641ed6d1e67463d8aa6bf02ac816a2e2a251b239dcb8d3b69271b1e9cfde1a9` |
+| `ag-relay_0.3.20_x64_zh-CN.msi` sha256 | `8a4362ffeda03171c373a69cc5af293165c5ebf6bc92f960212d81bc1186c0fa` |
+| `third-party-sources.tar.gz` sha256 | `a4d4ed83251f9431d0f93415110d913a1b36b8004b2d7a639bc9a5260cec9f7e` |
+| Release | [v0.3.20](https://github.com/xinxinxiaoxin/ag-relay/releases/tag/v0.3.20)（NSIS + MSI + 各自 `.sig` + `latest.json` + `SHA256SUMS` + 第三方源码附件） |
+
+**未覆盖错误保底**：Claude/Codex 在既有专用修复未覆盖的合格错误上，先原样确认一次，再按各自安全规则生成一次兼容请求，候选最多实际发送两次；不加预算、不跨请求记忆，不改正文、工具配对、身份或缓存键。两组默认开启且可关闭，仅“报错后”模式参与；明确限流/鉴权等及不安全历史不触发。说明见 [v0.3.20](docs/releases/v0.3.20.md)，细则见 [未覆盖错误保底](docs/retry-boundaries.md#uncovered-error-fallback)。
+
+### v0.3.19（历史）
 
 | 项 | 值 |
 | --- | --- |

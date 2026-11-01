@@ -551,6 +551,24 @@ const compatibilityKeys = new Map();
 // Codex fallback entries must neither affect nor evict the other clients' entries.
 const codexCompatibilityKeys = new Map();
 const fingerprint = (value) => createHash('sha256').update(value).digest('hex');
+// Cache affinity is not conversation identity. Keep only scoped hashes and generated keys.
+const cacheRouteKeys = new Map();
+function cacheRouteIdentity(bodyBuf, headers) {
+  const explicit = String(headers['x-relay-client'] || '').trim().toLowerCase();
+  const ua = String(headers['user-agent'] || '').toLowerCase();
+  if ((explicit && explicit !== 'claude') || /codex|zcode/.test(ua) ||
+      (explicit !== 'claude' && !ua.includes('claude'))) return null;
+  let obj;
+  try { obj = JSON.parse(bodyBuf.toString('utf8')); } catch { return null; }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj) || !nonEmptyStr(obj.prompt_cache_key)) return null;
+  return fingerprint(JSON.stringify([cfg.upstream, headers.authorization || '',
+    headers['x-api-key'] || '', headers['api-key'] || '', obj.model || '', obj.prompt_cache_key]));
+}
+function withCacheRouteKey(bodyBuf, key) {
+  const obj = JSON.parse(bodyBuf.toString('utf8'));
+  obj.prompt_cache_key = key;
+  return Buffer.from(JSON.stringify(obj), 'utf8');
+}
 
 function compatibilityIdentity(bodyBuf, headers, enabled = cfg.sessionCompat) {
   if (!enabled) return null;
@@ -1267,6 +1285,7 @@ async function handle(req, res, state) {
   const compatibilityCache = eligibleCodex ? codexCompatibilityKeys : compatibilityKeys;
   const compatibility = isResponses ? compatibilityIdentity(body, headers,
     policy.rememberSession && policy.historyMode === 'on_error') : null;
+  const cacheRoute = isResponses ? cacheRouteIdentity(body, headers) : null;
   delete headers['x-relay-session-id'];
   delete headers['x-relay-client'];
   if (isResponses && policy.historyMode === 'always') {
@@ -1314,6 +1333,14 @@ async function handle(req, res, state) {
       }
     }
   }
+  // Reuse a proven replacement rather than paying for a new cold cache on every turn.
+  if (cacheRoute) {
+    for (const [key, entry] of cacheRouteKeys) if (entry.expires <= Date.now()) cacheRouteKeys.delete(key);
+  }
+  let cacheRouteKey = cacheRoute ? cacheRouteKeys.get(cacheRoute)?.key : null;
+  if (cacheRouteKey) activeBody = withCacheRouteKey(activeBody, cacheRouteKey);
+  let cacheRateFailures = 0;
+  let cacheRouteChanged = false;
   // 上限可随着「通道类抖动」动态放宽
   let maxAttempts = policy.maxAttempts;
   const deadline = Date.now() + policy.totalBudgetMs;
@@ -1325,6 +1352,29 @@ async function handle(req, res, state) {
   const attemptTimeoutMs = connectTimeoutFor(body.length, policy.totalBudgetMs, policy.connectTimeoutMs);
   log(`incoming ${req.method} ${req.url} body=${(body.length / 1024).toFixed(0)}KB ` +
       `waitHeader=${Math.round(attemptTimeoutMs / 1000)}s budget=${Math.round(policy.totalBudgetMs / 1000)}s`);
+
+  // A sticky upstream cache route can rate-limit indefinitely despite fresh connections.
+  // Two explicit rate errors permit one new cache key, never a new session or lost history.
+  const noteCacheRateLimit = (classification, attempt) => {
+    if (!cacheRoute || cacheRouteChanged) return;
+    if (classification.permanent || !classification.retryable ||
+        String(classification.info?.code || '').toLowerCase() !== 'rate_limit_exceeded') {
+      cacheRateFailures = 0;
+      return;
+    }
+    if (++cacheRateFailures < 2 || attempt >= maxAttempts || ac.signal.aborted ||
+        deadline - Date.now() < cfg.minRetryWindowMs + policy.maxDelayMs) return;
+    cacheRouteKey = `ag-relay-${randomUUID()}`;
+    activeBody = withCacheRouteKey(activeBody, cacheRouteKey);
+    cacheRouteChanged = true;
+    log('repeated rate limit: trying one fresh cache route; history and session identity retained');
+  };
+  const rememberCacheRoute = () => {
+    if (!cacheRoute || !cacheRouteKey) return;
+    cacheRouteKeys.delete(cacheRoute);
+    cacheRouteKeys.set(cacheRoute, { key: cacheRouteKey, expires: Date.now() + cfg.sessionCompatTtlMs });
+    while (cacheRouteKeys.size > cfg.sessionCompatMaxKeys) cacheRouteKeys.delete(cacheRouteKeys.keys().next().value);
+  };
 
   const handleStatusError = (classification, attempt, source, status) => {
     if (!policy.repairStatus || classification.kind !== 'status') return null;
@@ -1614,6 +1664,7 @@ async function handle(req, res, state) {
         try { errorInfo = errorInfoFromJson(JSON.parse(text)); }
         catch { errorInfo = { message: text.trim() }; }
         const classification = classifyError(errorInfo, upstream.status);
+        noteCacheRateLimit(classification, attempt);
         const statusAction = handleStatusError(classification, attempt, 'http_error', upstream.status);
         if (statusAction === 'stop') return;
         if (statusAction === 'retry') { await retrySleep(cfg.deployDelayMs); continue; }
@@ -1649,6 +1700,7 @@ async function handle(req, res, state) {
         state.phase = 'waiting_first_content';
         const outcome = await peekAndCommit(upstream, res, () => diagnose('sse_committed', { status: 200 }), state, clientCodex);
         if (outcome.committed) {
+          if (outcome.terminalKind === 'response.completed') rememberCacheRoute();
           diagnose('sse_ended', { status: 200, sawTerminal: outcome.sawTerminal, terminalKind: outcome.terminalKind, idleAfterCommit: outcome.idleAfterCommit, stallReason: outcome.stallReason });
           if (attempt > 1) log(`attempt ${attempt}: recovered on a later route (previous failures: ${attempt - 1})`);
           return;
@@ -1656,6 +1708,7 @@ async function handle(req, res, state) {
         if (ac.signal.aborted) return;
         lastReason = outcome.reason;
         const classification = outcome.classification;
+        noteCacheRateLimit(classification, attempt);
         log(`attempt ${attempt}: ${lastReason}`);
         // 有界诊断：把「200 流内的失败」分类成固定枚举 + 上游错误指纹（不落盘文案）。
         // 之前这类失败没有任何诊断记录，只能靠反推，代价很大。
@@ -1713,6 +1766,7 @@ async function handle(req, res, state) {
 
       const info = errorInfoFromJson(obj);
       const classification = classifyError(info);
+      noteCacheRateLimit(classification, attempt);
       if (info) {
         const statusAction = handleStatusError(classification, attempt, 'json_error', upstream.status);
         if (statusAction === 'stop') return;
@@ -1757,6 +1811,7 @@ async function handle(req, res, state) {
         return sendRetryable(res, 429, lastReason, attempt, policy);
       }
 
+      if (!info) rememberCacheRoute();
       if (attempt > 1) log(`attempt ${attempt}: recovered on a later route (previous failures: ${attempt - 1})`);
       return passthrough(res, 200, upstream.headers, buf);
     } finally {

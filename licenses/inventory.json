@@ -6,22 +6,22 @@
   "inputs": [
     {
       "path": "package.json",
-      "sha256": "740d11a7d9395b11efeefe6b4403be6f7daee0473dc41ec190d7e4de4f214e80",
+      "sha256": "7146a800f290b3cf576ac1c0b7559f1d57b21baf878a1488e44e6a8bbd86b228",
       "normalizeLf": true
     },
     {
       "path": "package-lock.json",
-      "sha256": "562687f0dadf719bd99b1d26819fd7499a12381b3fdff110d59329862873dadb",
+      "sha256": "7d985b52f2064aa54ebc3e0c3b694f6b2dd954fdfb4c151d2706c680b4e59a22",
       "normalizeLf": true
     },
     {
       "path": "src-tauri/Cargo.lock",
-      "sha256": "4cb3f1d7ec67d9665dcd2430e166a1f44927d16591b9123c0a58b59d9ace371d",
+      "sha256": "88f9f861b64aa1e772456cc3e213c627c727c47f3cfa21db4536ec4ec4c31f4a",
       "normalizeLf": true
     },
     {
       "path": "src-tauri/Cargo.toml",
-      "sha256": "855f8b80db51f2242f60252ff9029aa8bab902b33b47dcbe71f0ab3d3752b7b8",
+      "sha256": "afdf3c5e4f7c41f594ea357d2c3d767ce6c7126f5c3af23fcc435c568a6d2d3f",
       "normalizeLf": true
     },
     {
@@ -16627,25 +16627,25 @@
     {
       "ecosystem": "toolchain-runtime",
       "name": "Rust standard library",
-      "version": "1.99.0",
+      "version": "1.99.1",
       "license": "MIT OR Apache-2.0; third-party exceptions in COPYRIGHT-library.html",
       "scope": "Rust 标准库及其内含第三方，按实际 rustc 工具链快照",
-      "source": "https://github.com/rust-lang/rust/tree/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4",
+      "source": "https://github.com/rust-lang/rust/tree/58cf8f9c35b355199727627d07ae34a4e2846d67",
       "materials": [
         {
           "path": "licenses/rust-std/LICENSE-MIT",
           "sha256": "b71bd43a069ca0641a9ecfe585ca7b3c53b5cc1608f8b68321168698e28b5ea1",
-          "source": "https://raw.githubusercontent.com/rust-lang/rust/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/LICENSE-MIT"
+          "source": "https://raw.githubusercontent.com/rust-lang/rust/58cf8f9c35b355199727627d07ae34a4e2846d67/LICENSE-MIT"
         },
         {
           "path": "licenses/rust-std/LICENSE-APACHE",
           "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
-          "source": "https://raw.githubusercontent.com/rust-lang/rust/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/LICENSE-APACHE"
+          "source": "https://raw.githubusercontent.com/rust-lang/rust/58cf8f9c35b355199727627d07ae34a4e2846d67/LICENSE-APACHE"
         },
         {
           "path": "licenses/rust-std/COPYRIGHT-library.html",
           "sha256": "5647be074c8edf7339fd863055923a8fc80bc5610a8d4661ec3b767b9d392c27",
-          "source": "rustup toolchain 1.99.0: share/doc/rust/COPYRIGHT-library.html"
+          "source": "rustup toolchain 1.99.1: share/doc/rust/COPYRIGHT-library.html"
         }
       ]
     },

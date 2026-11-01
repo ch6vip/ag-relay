@@ -1,6 +1,8 @@
 node_modules/
 dist/
 src-tauri/target/
+# 临时验证用的其他 Cargo 目标目录（如 target-safe-exit），绝不进入版本控制
+src-tauri/target-*/
 src-tauri/gen/schemas/
 src-tauri/generated/license-distribution/
 src-tauri/generated/.license-distribution-*/
@@ -15,3 +17,4 @@ release-artifacts/
 # 本机一次性调试/回滚记录，不进入版本控制
 .claude/debug/
 .claude/local-notes/
+.tmp/

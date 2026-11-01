@@ -15,8 +15,8 @@
 //!
 //! 权威事件码/子枚举清单：ag-relay-notes/diagnostics-codes.md（只读通读打包脚本得出）。
 //! 覆盖率契约测试（本文件末尾 mod tests）照 `gateway_env`↔`gateway-config.bat` 范式：
-//! 从只读打包脚本 `resources/gateway/relay-retry-proxy.mjs` 抽取全部 23 个 `event` 码，
-//! 断言字典全覆盖；上游加码即红。
+//! 从只读打包脚本 `resources/gateway/relay-retry-proxy.mjs` 抽取当前 24 个 `event` 码，
+//! 与当前写出契约严格核对；退役事件和枚举另列历史读取契约，不要求核心继续写出。
 
 use serde_json::Value;
 
@@ -134,6 +134,7 @@ fn explain(event: &str, title: &str, r: &Value, fallback: &str) -> (String, Stri
             let phase = match r.get("phase").and_then(Value::as_str) {
                 Some("receiving_request") => "正在接收客户端请求".into(),
                 Some("waiting_headers") => "等待上游响应，还未收到回复".into(),
+                Some("retry_waiting") => "网关正在等待后再试，不是上游正在生成内容；下一次尝试尚未发出".into(),
                 Some("reading_body") => "上游已响应，正在读取回复".into(),
                 Some("waiting_first_content") => "等待首段内容，上游已连接但还未返回可交付的内容".into(),
                 Some("stream_waiting") => "已开始传回内容，等待后续输出".into(),
@@ -153,6 +154,7 @@ fn explain(event: &str, title: &str, r: &Value, fallback: &str) -> (String, Stri
             let title = match r.get("phase").and_then(Value::as_str) {
                 Some("receiving_request") => "接收请求",
                 Some("waiting_headers") => "等待上游响应",
+                Some("retry_waiting") => "等待重试",
                 Some("reading_body") => "读取回复",
                 Some("waiting_first_content") => "等待首段内容",
                 Some("stream_waiting") => "等待后续内容",
@@ -200,6 +202,43 @@ fn explain(event: &str, title: &str, r: &Value, fallback: &str) -> (String, Stri
         "codex_session_passthrough" => ("保留原请求继续尝试", "为保留会话历史，网关没有删改原请求，继续按原请求尝试。".into()),
         "codex_resource_retry" => ("正在重新尝试", "上游未能接续当前会话，网关保留历史内容再次尝试。".into()),
         "codex_resource_exhausted" => ("本次自动恢复已停止", "已无法继续安全恢复，本次请求未能完成。请检查客户端结果后决定是否重新发起。".into()),
+        "request_summary" => {
+            let mut parts = Vec::new();
+            for (field, label) in [("attempts", "实际尝试"), ("rateErrors", "限流"), ("otherErrors", "其他错误")] {
+                if let Some(n) = num(r, field).filter(|n| *n >= 0) {
+                    parts.push(format!("{label} {n} 次"));
+                }
+            }
+            parts.push(format!("结果：{}", field_cn(r, "result").unwrap_or_else(|| "未确认".into())));
+            let note = if r.get("result").and_then(Value::as_str) == Some("json_returned") {
+                "已返回 JSON 响应不等于模型已成功完成。"
+            } else {
+                "该摘要只记录本次请求实际观察到的结果。"
+            };
+            ("请求处理摘要", format!("{}。{note}", parts.join("；")))
+        }
+        // 仅解释旧版日志；当前核心不再写出缓存路由事件。
+        "cache_route_summary" => {
+            let prepared = r.get("candidatePrepared").and_then(Value::as_bool);
+            let after = num(r, "afterAttempts");
+            let route = field_cn(r, "initialRoute").unwrap_or_else(|| "未知".into());
+            let result = field_cn(r, "result").unwrap_or_else(|| "未确认".into());
+            let detail = match (prepared, after) {
+                (Some(false), _) => format!("本次请求起始使用{route}，未准备新的缓存键；结果：{result}。"),
+                (Some(true), Some(0)) => format!("本次请求起始使用{route}，准备过新的缓存键，但尚未实际发送就结束了；结果：{result}。"),
+                (Some(true), Some(n)) if n > 0 => {
+                    let rate = num(r, "afterRateErrors").filter(|n| *n >= 0)
+                        .map(|n| format!("又发生 {n} 次限流，")).unwrap_or_default();
+                    if r.get("result").and_then(Value::as_str) == Some("stream_completed") {
+                        format!("本次请求起始使用{route}；之后换用了新的缓存键，{rate}最终完成。")
+                    } else {
+                        format!("本次请求起始使用{route}；之后换用了新的缓存键，{rate}结果：{result}。")
+                    }
+                }
+                _ => format!("本次请求起始使用{route}，换键过程记录不完整；结果：{result}。"),
+            };
+            ("缓存路由记录", format!("{detail}该记录只说明本次发生了什么，不能据此认定缓存通道损坏或换键一定有效。"))
+        }
         _ => (title, fallback.into()),
     };
     (title.to_string(), detail)
@@ -254,6 +293,20 @@ fn compact_summary(event: &str, r: &Value, title: &str) -> String {
         "session_compat_enabled" => "已记录兼容方式".into(),
         "session_compat_refused" => "历史内容无法安全改写".into(),
         "repair_applied" | "status_repair_applied" | "session_compat_applied" => "已调整不兼容字段".into(),
+        "request_summary" => field_cn(r, "result").unwrap_or_else(|| "结果未确认".into()),
+        "cache_route_summary" => {
+            match (r.get("candidatePrepared").and_then(Value::as_bool), num(r, "afterAttempts")) {
+                (Some(false), _) => "未换键".into(),
+                (Some(true), Some(0)) => "已准备，未尝试".into(),
+                (Some(true), Some(n)) if n > 0 => match r.get("result").and_then(Value::as_str) {
+                    Some("stream_completed") => "换键后完成".into(),
+                    Some("json_returned") => "换键后已返回 JSON".into(),
+                    Some("cancelled") => "换键后取消".into(),
+                    _ => "换键后未完成".into(),
+                },
+                _ => "换键记录不完整".into(),
+            }
+        }
         _ => "查看详情".into(),
     }
 }
@@ -273,7 +326,7 @@ fn duration_text(ms: i64) -> String {
 /// 属内部诊断、不进「最近活动」。
 const SUPPRESSED_EVENTS: &[&str] = &["request_profile"];
 
-/// 事件基表：`event` → (默认级别, 中文标题)。**23 项，与 diagnostics-codes.md §1 全列一致**。
+/// 当前核心写出事件基表：`event` → (默认级别, 中文标题)，共 24 项。
 /// 默认级别对 severity-依赖子字段的事件（sse_ended/finished/upstream_response/precommit_failure）
 /// 只是兜底，真正级别在 refine 里据子枚举覆盖。
 const EVENT_BASE: &[(&str, ActivityLevel, &str)] = &[
@@ -304,13 +357,18 @@ const EVENT_BASE: &[(&str, ActivityLevel, &str)] = &[
     ("codex_resource_retry", ActivityLevel::Info, "保留历史换通道重试"),
     ("codex_resource_exhausted", ActivityLevel::Error, "资源重试耗尽，放弃"),
     ("precommit_failure", ActivityLevel::Warn, "流式下发前失败"),
+    // E. 通用请求观察（1）
+    ("request_summary", ActivityLevel::Info, "请求处理摘要"),
 ];
 
-/// 子枚举中文标签表：(字段名, 枚举值) → 中文。**52 项**，按字段分组：
-/// source 6 / kind 11 / refusal 5 / terminalKind 7(含 null) / stallReason 6(含 null) /
-/// phase 8 / reason 6（status_repair 专属）/ status_band 3。
+/// 退役事件的只读兼容表，不属于当前核心写出契约。
+const LEGACY_EVENT_BASE: &[(&str, ActivityLevel, &str)] = &[
+    ("cache_route_summary", ActivityLevel::Info, "缓存路由记录"),
+];
+
+/// 当前子枚举中文标签表：(字段名, 枚举值) → 中文；历史专用项另列。
 /// 字段名区分同名异义值（如 refusal 与 reason 都有 wrong_endpoint/repair_exhausted/time_budget）。
-/// 取值与 diagnostics-codes.md §2 封闭枚举逐项对应。
+/// current/legacy 各自按独立清单逐项核对，不要求退役枚举留在核心源码。
 const SUB_LABELS: &[(&str, &str, &str)] = &[
     // source（6）—— 错误识别层 + 会话兼容来源（§2.A）
     ("source", "http_error", "HTTP 错误响应"),
@@ -323,6 +381,7 @@ const SUB_LABELS: &[(&str, &str, &str)] = &[
     ("kind", "azure_resource_mismatch", "跨 Azure 资源引用"),
     ("kind", "stale_reasoning_item", "失效的 reasoning 项"),
     ("kind", "session_binding_invalidated", "会话绑定失效（仅清历史编号）"),
+    ("kind", "account_reasoning_unavailable", "账号绑定的旧推理不可用"),
     ("kind", "other", "其他"),
     ("kind", "peek_timeout", "等待首个内容超时"),
     ("kind", "empty_stream_drop", "上游静默丢弃（空流）"),
@@ -352,9 +411,10 @@ const SUB_LABELS: &[(&str, &str, &str)] = &[
     ("stallReason", "transport_idle_timeout", "传输层空闲超时"),
     ("stallReason", "upstream_read_error", "上游读取错误"),
     ("stallReason", "event_size_limit", "单事件超缓冲上限"),
-    // phase（8）—— request_status 请求状态机（§2.G）
+    // phase（9）—— request_status 请求状态机（§2.G）
     ("phase", "receiving_request", "正在接收请求"),
     ("phase", "waiting_headers", "等待上游响应头"),
+    ("phase", "retry_waiting", "等待重试"),
     ("phase", "reading_body", "读取上游响应体"),
     ("phase", "waiting_first_content", "等待首个内容"),
     ("phase", "stream_waiting", "已下发，等待后续"),
@@ -372,6 +432,45 @@ const SUB_LABELS: &[(&str, &str, &str)] = &[
     ("status_band", "2xx", "成功"),
     ("status_band", "4xx", "请求被拒"),
     ("status_band", "5xx", "上游故障"),
+    // result（8）—— 本次请求实际结果，不等于故障归因
+    ("result", "unknown", "未确认"),
+    ("result", "json_returned", "已返回 JSON 响应"),
+    ("result", "stream_completed", "流式完整结束"),
+    ("result", "stream_failed", "流式未完整结束"),
+    ("result", "retry_exhausted", "重试预算或次数用尽"),
+    ("result", "permanent_error", "确定性错误"),
+    ("result", "error_passthrough", "错误原样返回"),
+    ("result", "cancelled", "客户端取消"),
+    // rateClass（6）—— 仅记录观察到的错误特征
+    ("rateClass", "none", "未出现限流"),
+    ("rateClass", "token_rate", "token 频率限流"),
+    ("rateClass", "request_rate", "请求频率限流"),
+    ("rateClass", "capacity", "容量压力"),
+    ("rateClass", "mixed", "混合限流特征"),
+    ("rateClass", "unknown", "未细分限流"),
+    // client（6）—— 有界客户端分类；unknown 是观察尚未建立时的初始值
+    ("client", "unknown", "客户端未知"),
+    ("client", "none", "未识别客户端"),
+    ("client", "zcode", "ZCode"),
+    ("client", "claude", "Claude"),
+    ("client", "codex", "Codex"),
+    ("client", "other", "其他客户端"),
+    // policyGroup（3）—— 实际采用的策略组
+    ("policyGroup", "unknown", "策略组未知"),
+    ("policyGroup", "codex", "Codex 策略组"),
+    ("policyGroup", "general", "通用策略组"),
+    // usageShape（3）—— 已有解析得到的用量形状，不推算未提供的 token 数
+    ("usageShape", "missing", "未提供用量"),
+    ("usageShape", "responses", "Responses 用量"),
+    ("usageShape", "chat", "Chat 用量"),
+];
+
+/// 旧缓存路由摘要的专用枚举，只服务历史日志读取。
+const LEGACY_SUB_LABELS: &[(&str, &str, &str)] = &[
+    ("initialRoute", "unknown", "未知"),
+    ("initialRoute", "ineligible", "不适用"),
+    ("initialRoute", "original", "客户端原键"),
+    ("initialRoute", "remembered", "已记录的成功键"),
 ];
 
 // ───────────────────────── 查表与透传辅助 ─────────────────────────
@@ -380,6 +479,7 @@ const SUB_LABELS: &[(&str, &str, &str)] = &[
 fn event_base(event: &str) -> Option<(ActivityLevel, &'static str)> {
     EVENT_BASE
         .iter()
+        .chain(LEGACY_EVENT_BASE.iter())
         .find(|(e, _, _)| *e == event)
         .map(|(_, lvl, title)| (*lvl, *title))
 }
@@ -388,6 +488,7 @@ fn event_base(event: &str) -> Option<(ActivityLevel, &'static str)> {
 fn sub_label(field: &str, value: &str) -> Option<&'static str> {
     SUB_LABELS
         .iter()
+        .chain(LEGACY_SUB_LABELS.iter())
         .find(|(f, v, _)| *f == field && *v == value)
         .map(|(_, _, cn)| *cn)
 }
@@ -562,6 +663,76 @@ fn refine(event: &str, base_level: ActivityLevel, record: &Value) -> (ActivityLe
             let kind_cn = field_cn(record, "kind").unwrap_or_else(|| "未知类别".to_string());
             (level, format!("流式下发前失败：{kind_cn}。"))
         }
+        "request_summary" => {
+            let mut parts = Vec::new();
+            for (field, label) in [
+                ("observationVersion", "观察版本"), ("inputBytes", "输入字节"),
+                ("inputItems", "输入条目"), ("attempts", "实际尝试次数"),
+                ("rateErrors", "限流次数"), ("otherErrors", "其他错误次数"),
+                ("waitHintSeen", "等待提示检查次数"), ("waitHintValid", "有效等待提示次数"),
+                ("waitHintInvalid", "无效等待提示次数"),
+                ("usageInputTokens", "输入 token"), ("usageOutputTokens", "输出 token"),
+                ("usageCachedTokens", "已缓存 token"), ("usageCacheReadTokens", "缓存读取 token"),
+                ("usageCacheCreationTokens", "缓存创建 token"),
+            ] {
+                if let Some(n) = num(record, field).filter(|n| *n >= 0) {
+                    parts.push(format!("{label}：{n}"));
+                }
+            }
+            for (field, label) in [("client", "客户端"), ("policyGroup", "策略组"), ("usageShape", "用量形状")] {
+                if let Some(value) = field_cn(record, field) { parts.push(format!("{label}：{value}")); }
+            }
+            if let Some(hash) = text(record, "modelHash") { parts.push(format!("模型哈希：{hash}")); }
+            for (field, label) in [("rateFirstClass", "首次限流类别"), ("rateLastClass", "末次限流类别")] {
+                if let Some(value) = field_token(record, field) {
+                    parts.push(format!("{label}：{}", sub_cn("rateClass", &value)));
+                }
+            }
+            if let Some(mixed) = record.get("rateClassMixed").and_then(Value::as_bool) {
+                parts.push(format!("限流类别是否变化：{}", if mixed { "是" } else { "否" }));
+            }
+            if let Some(ms) = num(record, "waitHintMaxMs").filter(|n| *n >= 0) {
+                parts.push(format!("最大等待提示：{ms} ms（仅观察，不代表实际等待时长）"));
+            }
+            parts.push(format!("结果：{}", field_cn(record, "result").unwrap_or_else(|| "未确认".into())));
+            if record.get("terminalKind").is_some_and(|v| !v.is_null()) {
+                if let Some(value) = field_cn(record, "terminalKind") { parts.push(format!("终止类型：{value}")); }
+            }
+            for (field, label) in [("firstContentMs", "首次内容"), ("elapsedMs", "总耗时")] {
+                if let Some(ms) = num(record, field).filter(|n| *n >= 0) {
+                    parts.push(format!("{label} {}", duration_text(ms)));
+                }
+            }
+            (base_level, parts.join("；") + "。")
+        }
+        "cache_route_summary" => {
+            let prepared = record.get("candidatePrepared").and_then(Value::as_bool);
+            let mut parts = vec![
+                format!("起始选键：{}", field_cn(record, "initialRoute").unwrap_or_else(|| "未知".into())),
+            ];
+            if let Some(prepared) = prepared {
+                parts.push(format!("是否准备换键：{}", if prepared { "是" } else { "否" }));
+            }
+            for (prefix, title) in [("before", "前段"), ("after", "换键后")] {
+                if prefix == "after" && !(prepared == Some(true) && num(record, "afterAttempts").is_some_and(|n| n > 0)) { continue; }
+                if let Some(n) = num(record, &format!("{prefix}Attempts")).filter(|n| *n >= 0) {
+                    parts.push(format!("{title}尝试 {n} 次"));
+                }
+                for (suffix, label) in [("RateErrors", "限流"), ("OtherErrors", "其他错误")] {
+                    if let Some(n) = num(record, &format!("{prefix}{suffix}")).filter(|n| *n >= 0) {
+                        parts.push(format!("{title}{label} {n} 次"));
+                    }
+                }
+            }
+            parts.push(format!("结果：{}", field_cn(record, "result").unwrap_or_else(|| "未确认".into())));
+            if let Some(ms) = num(record, "firstContentMs").filter(|n| *n >= 0) {
+                parts.push(format!("首次内容 {}", duration_text(ms)));
+            }
+            if let Some(ms) = num(record, "elapsedMs").filter(|n| *n >= 0) {
+                parts.push(format!("总耗时 {}", duration_text(ms)));
+            }
+            (base_level, parts.join("；") + "。")
+        }
         _ => (base_level, String::new()),
     }
 }
@@ -597,23 +768,26 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    // ────────── 权威清单（独立真值，来源 diagnostics-codes.md §1/§2/§5；file:line 见该文档） ──────────
-    // 与 gateway_env 的 EXPECTED_17 同角色：契约测试把它与打包脚本只读抽取结果交叉核对。
+    // ────────── 独立契约清单：当前写出与历史可读分别核对 ──────────
+    // 当前清单与打包核心抽取结果交叉核对；历史清单只约束读取兼容，不要求核心保留旧字面量。
 
-    const EXPECTED_EVENTS: [&str; 23] = [
+    const EXPECTED_ACTIVE_EVENTS: [&str; 24] = [
         "gateway_started", "gateway_draining", "request_status", "received", "request_profile",
         "attempt_started", "upstream_response", "sse_committed", "sse_ended", "finished",
         "client_closed", "session_compat_refused", "codex_session_passthrough",
         "session_compat_applied", "session_compat_enabled", "status_repair_refused",
         "status_repair_applied", "item_error", "repair_refused", "repair_applied",
         "codex_resource_retry", "codex_resource_exhausted", "precommit_failure",
+        "request_summary",
     ];
+    const EXPECTED_LEGACY_EVENTS: [&str; 1] = ["cache_route_summary"];
     const EXPECTED_SOURCE: [&str; 6] = [
         "http_error", "sse_precommit", "json_error", "json_empty",
         "explicit_session", "resource_lineage",
     ];
-    const EXPECTED_KIND: [&str; 11] = [
-        "azure_resource_mismatch", "stale_reasoning_item", "session_binding_invalidated", "other", "peek_timeout",
+    const EXPECTED_KIND: [&str; 12] = [
+        "azure_resource_mismatch", "stale_reasoning_item", "session_binding_invalidated",
+        "account_reasoning_unavailable", "other", "peek_timeout",
         "empty_stream_drop", "read_timeout", "buffer_limit", "stream_error",
         "empty_stream_shape", "empty_stream_reasoning",
     ];
@@ -630,8 +804,8 @@ mod tests {
         "null", "progress_timeout", "client_closed", "transport_idle_timeout",
         "upstream_read_error", "event_size_limit",
     ];
-    const EXPECTED_PHASE: [&str; 8] = [
-        "receiving_request", "waiting_headers", "reading_body", "waiting_first_content",
+    const EXPECTED_PHASE: [&str; 9] = [
+        "receiving_request", "waiting_headers", "retry_waiting", "reading_body", "waiting_first_content",
         "stream_waiting", "reasoning", "tool_output", "text_output",
     ];
     const EXPECTED_STATUS_REPAIR_REASON: [&str; 6] = [
@@ -639,6 +813,30 @@ mod tests {
         "invalid_json", "unsupported_item", "time_budget",
     ];
     const EXPECTED_STATUS_BAND: [&str; 3] = ["2xx", "4xx", "5xx"];
+    // 只有起始选键属于退役协议，其余通用观察枚举由 request_summary 继续使用。
+    const EXPECTED_LEGACY_INITIAL_ROUTE: [&str; 4] = ["unknown", "ineligible", "original", "remembered"];
+    const EXPECTED_RESULT: [&str; 8] = [
+        "unknown", "json_returned", "stream_completed", "stream_failed",
+        "retry_exhausted", "permanent_error", "error_passthrough", "cancelled",
+    ];
+    const EXPECTED_RATE_CLASS: [&str; 6] = [
+        "none", "token_rate", "request_rate", "capacity", "mixed", "unknown",
+    ];
+    const EXPECTED_CLIENT: [&str; 6] = ["unknown", "none", "zcode", "claude", "codex", "other"];
+    const EXPECTED_POLICY_GROUP: [&str; 3] = ["unknown", "codex", "general"];
+    const EXPECTED_USAGE_SHAPE: [&str; 3] = ["missing", "responses", "chat"];
+    const EXPECTED_ACTIVE_SUB_ENUMS: &[(&str, &[&str])] = &[
+        ("source", &EXPECTED_SOURCE), ("kind", &EXPECTED_KIND),
+        ("refusal", &EXPECTED_REFUSAL), ("terminalKind", &EXPECTED_TERMINAL_KIND),
+        ("stallReason", &EXPECTED_STALL_REASON), ("phase", &EXPECTED_PHASE),
+        ("reason", &EXPECTED_STATUS_REPAIR_REASON), ("status_band", &EXPECTED_STATUS_BAND),
+        ("result", &EXPECTED_RESULT), ("rateClass", &EXPECTED_RATE_CLASS),
+        ("client", &EXPECTED_CLIENT), ("policyGroup", &EXPECTED_POLICY_GROUP),
+        ("usageShape", &EXPECTED_USAGE_SHAPE),
+    ];
+    const EXPECTED_LEGACY_SUB_ENUMS: &[(&str, &[&str])] = &[
+        ("initialRoute", &EXPECTED_LEGACY_INITIAL_ROUTE),
+    ];
 
     // ────────── 打包脚本只读抽取（照 gateway_env↔bat：从真值源抽取再比对） ──────────
 
@@ -678,8 +876,7 @@ mod tests {
         set
     }
 
-    /// 覆盖率契约（主闸门）：从只读打包脚本抽取的 event 码，必须恰为清单 23 项，
-    /// 且字典（EVENT_BASE）对每一项都有中文条目。上游新增/删除事件码即红。
+    /// 旧重试边界 fixture 的事件与关联信息仍需保持可读。
     #[test]
     fn 重试边界诊断样本_沿用事件码并保留关联信息() {
         let samples = include_str!("../tests/fixtures/diagnostics-retry-boundaries.jsonl");
@@ -739,86 +936,89 @@ mod tests {
         }
     }
 
+    /// 当前写出契约主闸门：抽取事件码必须恰为当前清单 24 项。
     #[test]
-    fn 契约_打包脚本事件码恰为清单23项且字典全覆盖() {
-        let text = std::fs::read_to_string(mjs_path()).expect("读取打包脚本失败（禁改，只读）");
+    fn 契约_打包脚本事件码恰为清单24项且字典全覆盖() {
+        let text = std::fs::read_to_string(mjs_path()).expect("读取打包脚本失败（只读）");
         let scanned = extract_events(&text);
-        let expected: BTreeSet<String> = EXPECTED_EVENTS.iter().map(|s| s.to_string()).collect();
-
-        // 抽取自洽：脚本里的 event 码恰为清单（diagnostics-codes.md §1 的 23 项）
-        assert_eq!(expected.len(), 23, "清单应恰 23 项");
+        let expected: BTreeSet<String> = EXPECTED_ACTIVE_EVENTS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(expected.len(), 24, "当前写出清单应恰 24 项");
         assert_eq!(
             scanned, expected,
-            "打包脚本 event 码与清单不一致（上游改动？）。\n脚本独有：{:?}\n清单独有：{:?}",
+            "打包脚本 event 码与当前写出清单不一致。\n脚本独有：{:?}\n清单独有：{:?}",
             scanned.difference(&expected).collect::<Vec<_>>(),
             expected.difference(&scanned).collect::<Vec<_>>()
         );
-
-        // 字典全覆盖：每个脚本会发的 event 都有基表条目（非回退）
         for e in &scanned {
-            assert!(event_base(e).is_some(), "字典缺事件码 `{e}` 的中文条目");
+            assert!(EVENT_BASE.iter().any(|row| row.0 == e), "当前字典缺事件码 `{e}`");
+        }
+        for e in EXPECTED_LEGACY_EVENTS {
+            assert!(!scanned.contains(e), "退役事件 `{e}` 不应继续写出");
         }
     }
 
-    /// 字典对清单每个封闭子枚举值都有中文标签；且每个值（null 除外）确为脚本中的字面量
-    /// （上游重命名/删除子枚举值 → 其字面量消失 → 红）。
+    /// 当前枚举仍严格核对核心字面量；历史枚举不参与此检查。
     #[test]
-    fn 契约_字典覆盖全部子枚举值且与脚本字面量一致() {
+    fn 契约_当前子枚举字典覆盖且与脚本字面量一致() {
         let text = std::fs::read_to_string(mjs_path()).expect("读取打包脚本失败");
-        let groups: [(&str, &[&str]); 8] = [
-            ("source", &EXPECTED_SOURCE),
-            ("kind", &EXPECTED_KIND),
-            ("refusal", &EXPECTED_REFUSAL),
-            ("terminalKind", &EXPECTED_TERMINAL_KIND),
-            ("stallReason", &EXPECTED_STALL_REASON),
-            ("phase", &EXPECTED_PHASE),
-            ("reason", &EXPECTED_STATUS_REPAIR_REASON),
-            ("status_band", &EXPECTED_STATUS_BAND),
-        ];
-        for (field, values) in groups {
+        for &(field, values) in EXPECTED_ACTIVE_SUB_ENUMS {
             for &v in values {
-                // 字典覆盖（非回退）
-                assert!(
-                    sub_label(field, v).is_some(),
-                    "字典缺子枚举 `{field}={v}` 的中文标签"
-                );
-                // 与脚本字面量一致（null 是 JS null、status_band 是壳侧派生段，均跳过字面量核对）
+                assert!(SUB_LABELS.iter().any(|row| row.0 == field && row.1 == v),
+                    "当前字典缺子枚举 `{field}={v}` 的中文标签");
+                // null 是 JS null；status_band 是壳侧派生段，均不作为脚本字符串核对。
                 if v != "null" && field != "status_band" {
                     let needle = format!("'{v}'");
-                    assert!(
-                        text.contains(needle.as_str()),
-                        "子枚举值 `{field}={v}` 未作为字面量出现在打包脚本（上游改名？）"
-                    );
+                    assert!(text.contains(needle.as_str()),
+                        "当前子枚举 `{field}={v}` 未作为字面量出现在打包脚本");
                 }
             }
         }
     }
 
-    /// 字典键计数（可报告锚点）：23 事件基 + 52 子枚举标签 = 75；且无清单外多余条目。
-    /// 52 = source6 + kind11 + refusal5 + terminalKind7 + stallReason6 + phase8 + reason6 + band3
-    /// （前两项 23/49 为核心事件与子枚举；band3 为壳侧派生的 HTTP 段）。
+    /// 当前与历史清单分别做集合相等、去重和计数；不能用历史字典掩盖当前缺项。
     #[test]
     fn 契约_字典键计数且无清单外多余条目() {
-        assert_eq!(EVENT_BASE.len(), 23, "事件基表应恰 23 项");
-        // 事件基表 ⊆ 清单（无多余事件）
-        let expected_events: BTreeSet<&str> = EXPECTED_EVENTS.iter().copied().collect();
-        for row in EVENT_BASE {
-            assert!(expected_events.contains(row.0), "事件基表出现清单外事件 `{}`", row.0);
+        let active_events: BTreeSet<_> = EVENT_BASE.iter().map(|row| row.0).collect();
+        let legacy_events: BTreeSet<_> = LEGACY_EVENT_BASE.iter().map(|row| row.0).collect();
+        assert_eq!(active_events, EXPECTED_ACTIVE_EVENTS.into_iter().collect());
+        assert_eq!(legacy_events, EXPECTED_LEGACY_EVENTS.into_iter().collect());
+        assert_eq!(EVENT_BASE.len(), 24);
+        assert_eq!(LEGACY_EVENT_BASE.len(), 1);
+        assert!(active_events.is_disjoint(&legacy_events));
+
+        for (labels, groups, count) in [
+            (SUB_LABELS, EXPECTED_ACTIVE_SUB_ENUMS, 80),
+            (LEGACY_SUB_LABELS, EXPECTED_LEGACY_SUB_ENUMS, 4),
+        ] {
+            let actual: BTreeSet<_> = labels.iter().map(|row| (row.0, row.1)).collect();
+            let expected: BTreeSet<_> = groups.iter()
+                .flat_map(|(field, values)| values.iter().map(move |value| (*field, *value))).collect();
+            assert_eq!(actual, expected, "字典必须逐项等于对应清单");
+            assert_eq!(labels.len(), actual.len(), "不允许重复字典键");
+            assert_eq!(labels.len(), count, "字典标签数与契约不一致");
+            assert!(labels.iter().all(|row| !row.2.is_empty()), "中文标签不能为空");
         }
+        assert!(SUB_LABELS.iter().all(|row| !LEGACY_SUB_LABELS.iter()
+            .any(|old| old.0 == row.0 && old.1 == row.1)), "当前与历史枚举不能重复");
+        assert_eq!(EVENT_BASE.len() + LEGACY_EVENT_BASE.len() + SUB_LABELS.len() + LEGACY_SUB_LABELS.len(), 109);
+    }
 
-        // 子枚举标签分字段计数，逐字段与清单条数一致（防多译/漏译）
-        let count = |f: &str| SUB_LABELS.iter().filter(|t| t.0 == f).count();
-        assert_eq!(count("source"), EXPECTED_SOURCE.len());
-        assert_eq!(count("kind"), EXPECTED_KIND.len());
-        assert_eq!(count("refusal"), EXPECTED_REFUSAL.len());
-        assert_eq!(count("terminalKind"), EXPECTED_TERMINAL_KIND.len());
-        assert_eq!(count("stallReason"), EXPECTED_STALL_REASON.len());
-        assert_eq!(count("phase"), EXPECTED_PHASE.len());
-        assert_eq!(count("reason"), EXPECTED_STATUS_REPAIR_REASON.len());
-        assert_eq!(count("status_band"), EXPECTED_STATUS_BAND.len());
-
-        assert_eq!(SUB_LABELS.len(), 52, "子枚举标签应恰 52 项");
-        assert_eq!(EVENT_BASE.len() + SUB_LABELS.len(), 75, "字典键总数应为 75");
+    #[test]
+    fn 契约_历史事件和枚举保持可读且不冒充当前写出() {
+        for event in EXPECTED_LEGACY_EVENTS {
+            let localized = localize_record(&json!({"event": event})).unwrap();
+            assert!(!localized.title.contains("未识别事件"));
+            assert!(LEGACY_EVENT_BASE.iter().any(|row| row.0 == event));
+            assert!(!EVENT_BASE.iter().any(|row| row.0 == event));
+        }
+        for &(field, values) in EXPECTED_LEGACY_SUB_ENUMS {
+            for &value in values {
+                assert!(sub_label(field, value).is_some(), "旧枚举 {field}={value} 必须可读");
+                let localized = localize_record(&json!({"event":"cache_route_summary",(field):value})).unwrap();
+                assert!(!localized.technical_detail.contains("原始码"));
+                assert!(localized.technical_detail.contains(sub_label(field, value).unwrap()));
+            }
+        }
     }
 
     /// 真实样本（trimmed）：读 tests/fixtures/diagnostics-samples.jsonl，逐条断言译文/级别。
@@ -912,6 +1112,165 @@ mod tests {
         let pf = localize_record(pick(&recs, |r| ev(r) == "precommit_failure")).unwrap();
         assert_eq!(pf.level, Error, "kind=stream_error → 错误");
         assert!(pf.technical_detail.contains("流内携带错误"), "{}", pf.technical_detail);
+
+        // 缓存路由观察：只陈述本次事实，不冒充故障结论
+        let cr = localize_record(pick(&recs, |r| ev(r) == "cache_route_summary")).unwrap();
+        assert_eq!(cr.level, Info);
+        assert_eq!(cr.title, "缓存路由记录");
+        assert_eq!(cr.summary, "换键后完成");
+        assert!(cr.detail.contains("客户端原键"), "{}", cr.detail);
+        assert!(cr.detail.contains("新的缓存键"), "{}", cr.detail);
+        assert!(cr.detail.contains("最终完成"), "{}", cr.detail);
+        assert!(cr.detail.contains("不能据此认定缓存通道损坏"), "{}", cr.detail);
+        assert!(cr.technical_detail.contains("流式完整结束"), "{}", cr.technical_detail);
+        assert!(cr.technical_detail.contains("换键后尝试 3 次"), "{}", cr.technical_detail);
+    }
+
+    #[test]
+    fn 请求摘要新样本_读取通用观察且没有换键字段() {
+        let recs = load_fixture();
+        let samples: Vec<_> = recs.iter().filter(|r| ev(r) == "request_summary").collect();
+        assert_eq!(samples.len(), 2);
+        let fields: BTreeSet<_> = [
+            "time", "event", "requestId", "path", "attempt", "status", "elapsedMs",
+            "observationVersion", "client", "policyGroup", "inputBytes", "inputItems", "modelHash",
+            "attempts", "rateErrors", "otherErrors", "rateFirstClass", "rateLastClass", "rateClassMixed",
+            "waitHintSeen", "waitHintValid", "waitHintMaxMs", "waitHintInvalid", "firstContentMs",
+            "result", "terminalKind", "usageShape", "usageInputTokens", "usageOutputTokens",
+            "usageCachedTokens", "usageCacheReadTokens", "usageCacheCreationTokens",
+        ].into_iter().collect();
+        for sample in &samples {
+            let keys: BTreeSet<_> = sample.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(keys, fields, "新样本只包含通用协议字段，不能残留换键字段");
+            assert_eq!(sample["observationVersion"], 1);
+        }
+        let event = localize_record(samples[0]).unwrap();
+        assert_eq!(event.code, "request_summary");
+        assert_eq!(event.title, "请求处理摘要");
+        assert_eq!(event.summary, "流式完整结束");
+        assert_eq!(event.level, ActivityLevel::Info);
+        assert_eq!(event.attempt, Some(5));
+        assert_eq!(event.http_status, Some(200));
+        assert_eq!(event.request_id.as_deref(), samples[0]["requestId"].as_str());
+        assert_eq!(event.time, samples[0]["time"].as_str().unwrap());
+        for expected in ["实际尝试 5 次", "限流 3 次", "其他错误 1 次"] {
+            assert!(event.detail.contains(expected), "{}", event.detail);
+        }
+        for expected in [
+            "观察版本：1", "输入字节：240000", "输入条目：120", "客户端：Claude", "策略组：通用策略组",
+            "实际尝试次数：5", "首次限流类别：token 频率限流", "末次限流类别：请求频率限流",
+            "限流类别是否变化：是", "等待提示检查次数：4", "有效等待提示次数：2", "无效等待提示次数：1",
+            "最大等待提示：2000 ms", "仅观察，不代表实际等待时长", "首次内容 12秒", "总耗时 18秒",
+            "终止类型：正常完成", "用量形状：Responses 用量", "输入 token：240000", "输出 token：300", "已缓存 token：200000",
+        ] {
+            assert!(event.technical_detail.contains(expected), "缺少 {expected}：{}", event.technical_detail);
+        }
+        assert!(event.technical_detail.contains(samples[0]["modelHash"].as_str().unwrap()));
+        for forbidden in ["换键", "起始选键", "前段", "缓存读取 token：0", "缓存创建 token：0"] {
+            assert!(!event.technical_detail.contains(forbidden), "{}", event.technical_detail);
+        }
+    }
+
+    #[test]
+    fn 请求摘要_JSON已返回不冒充模型成功_缺失值不补零() {
+        let recs = load_fixture();
+        let event = localize_record(pick(&recs, |r| ev(r) == "request_summary" && r["result"] == "json_returned")).unwrap();
+        assert_eq!(event.summary, "已返回 JSON 响应");
+        assert!(event.detail.contains("已返回 JSON 响应不等于模型已成功完成"));
+        assert!(!event.detail.contains("最终完成"));
+        assert!(event.technical_detail.contains("未提供用量"));
+        for forbidden in ["输入 token：", "输出 token：", "已缓存 token：", "首次内容", "最大等待提示", "截断"] {
+            assert!(!event.technical_detail.contains(forbidden), "{}", event.technical_detail);
+        }
+        for record in [
+            json!({"event":"request_summary"}),
+            json!({"event":"request_summary","attempts":null,"rateErrors":null,"otherErrors":null,"usageInputTokens":null}),
+        ] {
+            let event = localize_record(&record).unwrap();
+            assert_eq!(event.attempt, None);
+            assert_eq!(event.http_status, None);
+            assert_eq!(event.summary, "结果未确认");
+            assert_eq!(event.technical_detail, "结果：未确认。");
+            assert!(!event.detail.contains("0 次"));
+        }
+        let zero = localize_record(&json!({"event":"request_summary","attempts":0,"rateErrors":0,"usageInputTokens":0,"usageCacheReadTokens":7,"usageCacheCreationTokens":9})).unwrap();
+        for expected in ["实际尝试次数：0", "限流次数：0", "输入 token：0", "缓存读取 token：7", "缓存创建 token：9"] {
+            assert!(zero.technical_detail.contains(expected), "实际报告的值须保留：{}", zero.technical_detail);
+        }
+    }
+
+    #[test]
+    fn 请求摘要_全部结果与枚举可读且未知值诚实回退() {
+        for result in EXPECTED_RESULT {
+            let event = localize_record(&json!({"event":"request_summary","result":result})).unwrap();
+            assert_eq!(event.summary, sub_label("result", result).unwrap());
+            assert!(!event.technical_detail.contains("原始码"));
+        }
+        for (field, dictionary, values) in [
+            ("rateFirstClass", "rateClass", EXPECTED_RATE_CLASS.as_slice()),
+            ("rateLastClass", "rateClass", EXPECTED_RATE_CLASS.as_slice()),
+            ("client", "client", EXPECTED_CLIENT.as_slice()),
+            ("policyGroup", "policyGroup", EXPECTED_POLICY_GROUP.as_slice()),
+            ("usageShape", "usageShape", EXPECTED_USAGE_SHAPE.as_slice()),
+        ] {
+            for value in values {
+                let event = localize_record(&json!({"event":"request_summary",(field):value})).unwrap();
+                assert!(event.technical_detail.contains(sub_label(dictionary, value).unwrap()));
+                assert!(!event.technical_detail.contains("原始码"));
+            }
+        }
+        for field in ["result", "rateFirstClass", "rateLastClass", "client", "policyGroup", "usageShape", "terminalKind"] {
+            let event = localize_record(&json!({"event":"request_summary",(field):"future_value"})).unwrap();
+            assert!(event.technical_detail.contains("原始码：future_value"), "{field} 必须诚实回退");
+        }
+        let event = localize_record(&json!({"event":"request_status","phase":"future_phase"})).unwrap();
+        assert!(event.detail.contains("原始码：future_phase"));
+    }
+
+    #[test]
+    fn 请求摘要_不读取退役字段_旧摘要仍按旧协议解释() {
+        let base = json!({"event":"request_summary","result":"cancelled","attempts":2});
+        let mut mixed = base.clone();
+        for (field, value) in json!({"initialRoute":"remembered","scopeHash":"old-scope","firstKeyHash":"old-key","lastKeyHash":"new-key","candidatePrepared":true,"candidatePreparedMs":1,"candidateStartMs":2,"remainingBudgetMs":3000,"mappingRecorded":true,"beforeAttempts":9,"afterAttempts":8,"beforeRateErrors":7,"afterRateErrors":6,"beforeOtherErrors":5,"afterOtherErrors":4,"beforeElapsedMs":3,"afterElapsedMs":2}).as_object().unwrap() {
+            mixed[field] = value.clone();
+        }
+        assert_eq!(localize_record(&base), localize_record(&mixed), "新事件不能走历史换键解释");
+        let old = localize_record(&json!({"event":"cache_route_summary","candidatePrepared":true,"afterAttempts":1,"result":"json_returned"})).unwrap();
+        assert_eq!(old.summary, "换键后已返回 JSON");
+        assert!(old.detail.contains("已返回 JSON 响应"));
+        assert!(!old.detail.contains("最终完成"));
+        let partial = localize_record(&json!({"event":"cache_route_summary"})).unwrap();
+        assert_eq!(partial.summary, "换键记录不完整");
+        assert!(!partial.technical_detail.contains("0 次"));
+        assert!(!partial.technical_detail.contains("是否准备换键：否"));
+    }
+
+    #[test]
+    fn 等待重试样本_网关等待不是上游生成且尝试次数不预增() {
+        let recs = load_fixture();
+        let record = pick(&recs, |r| ev(r) == "request_status" && r["phase"] == "retry_waiting");
+        let event = localize_record(record).unwrap();
+        assert_eq!(event.title, "等待重试");
+        assert_eq!(event.attempt, Some(3));
+        assert_eq!(event.summary, "已用时 1分5秒");
+        assert!(event.detail.contains("网关正在等待后再试，不是上游正在生成内容"));
+        assert!(event.detail.contains("下一次尝试尚未发出"));
+        assert!(event.detail.contains("第 3 次尝试"));
+        assert!(event.detail.contains("尚未收到内容进展"));
+        for forbidden in ["第 4 次", "倒计时", "剩余", "预计"] { assert!(!event.detail.contains(forbidden)); }
+        let mut next = record.clone();
+        next["phase"] = json!("waiting_headers");
+        next["attempt"] = json!(4);
+        let event = localize_record(&next).unwrap();
+        assert_eq!(event.title, "等待上游响应");
+        assert_eq!(event.attempt, Some(4));
+    }
+
+    #[test]
+    fn 账号绑定旧推理错误_保留中文映射() {
+        let event = localize_record(&json!({"event":"item_error","kind":"account_reasoning_unavailable","source":"json_error","status":200})).unwrap();
+        assert_eq!(event.summary, "账号绑定的旧推理不可用");
+        assert!(event.technical_detail.contains("账号绑定的旧推理不可用"));
     }
 
     /// 样本未触发的 7 个事件（手造最小记录，字段形状照 diagnostics-codes.md §1/§2）。

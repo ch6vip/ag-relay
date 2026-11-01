@@ -21,6 +21,20 @@ test('请求进展展示真实耗时与尝试，尚无内容不伪造进展或�
   assert.doesNotMatch(html, /已卡死|预计.*\d.*完成|倒计时/)
 })
 
+test('等待重试说明是网关等待，保留实际尝试次数且不显示倒计时', () => {
+  const html = render({ ...running, requests: [{ ...running.requests![0], phase: 'retry_waiting' }] })
+  assert.match(html, /等待重试/)
+  assert.match(html, /网关正在等待后再试，不是上游正在生成内容；下一次尝试尚未发出。/)
+  assert.match(html, /第 3 次尝试/)
+  assert.match(html, /1分5秒/)
+  assert.doesNotMatch(html, /第 4 次尝试|倒计时|剩余[^<>]*\d[^<>]*秒|预计[^<>]*\d[^<>]*完成/)
+  assert.equal((html.match(/<th\b/g) ?? []).length, 6, '沿用既有表格列')
+  const next = render({ ...running, requests: [{ ...running.requests![0], phase: 'waiting_headers', attempt: 4 }] })
+  assert.match(next, /等待上游响应/)
+  assert.match(next, /第 4 次尝试/)
+  assert.doesNotMatch(next, /等待重试/)
+})
+
 test('旧核心无详情和离线不误报空闲，未知阶段诚实回退', () => {
   assert.match(render({ ...running, requests: null }), /暂未提供请求详情/)
   assert.match(render({ ...running, state: 'stopped' }), /网关未连接/)

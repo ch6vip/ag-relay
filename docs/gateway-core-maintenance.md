@@ -62,7 +62,7 @@ Node 可用 `--test-name-pattern`、Rust 可用测试名称筛选；名称来自
 | 测试模块 | 能证明的契约 | 不能替代的验收 |
 | --- | --- | --- |
 | `gateway_env::tests` | 当前 17 项默认配置与入库 bat 一致、追加诊断路径且不替 supervisor 设置 `PROXY_SUPERVISED` | 真实核心启动后设置生效 |
-| `gateway_diagnostics::tests` | 打包核心当前 23 个事件码、子枚举的字典覆盖，真实形状样本的译文/级别与未知码回退 | 核心真实写入到面板显示的贯通链路 |
+| `gateway_diagnostics::tests` | 打包核心当前24个事件码及封闭子枚举；与已退役的 `cache_route_summary` 历史读取兼容分开核对，覆盖真实形状样本、中文解释和未知值回退 | 核心真实写入到面板显示的贯通链路 |
 | `gateway_diagnostics_reader::tests` | 临时诊断文件的增量读取、未完成尾行、轮转补读、分页、筛选与搜索 | 成品窗口里的实时通知与交互 |
 | `gateway_activity::tests` | 临时目录 + 文件通知（notify）驱动的实时活动订阅、归属撤销与错误恢复；不触网关进程 | 成品窗口的实时追新与冻结交互 |
 | `gateway_control::tests` | 持有监听器的随机本机端口假服务验证重启请求、控制头、2xx 受理、异常/超时；临时日志目录 | 真实优雅排空、重启完成；释放端口后的连接拒绝用例不在本机白名单内 |

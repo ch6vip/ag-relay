@@ -103,7 +103,7 @@ async function fixture(t, respond, settings = policy(), extraEnv = {}, startupOn
       const body = JSON.parse(raw)
       captured.push({ raw, body })
       const reply = await respond(body, captured.length, req)
-      res.writeHead(reply.status, { 'content-type': reply.type ?? 'application/json', connection: 'close' })
+      res.writeHead(reply.status, { 'content-type': reply.type ?? 'application/json', connection: 'close', ...(reply.headers ?? {}) })
       res.end(typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body))
     } catch (error) {
       upstreamError = error
@@ -173,6 +173,15 @@ async function fixture(t, respond, settings = policy(), extraEnv = {}, startupOn
   return {
     captured, status: getStatus,
     diagnostics: () => readFileSync(join(dir, 'diagnostics.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
+    async summaries(count = 1) {
+      const deadline = Date.now() + 2000
+      while (Date.now() < deadline) {
+        const rows = this.diagnostics().filter(row => row.event === 'request_summary')
+        if (rows.length >= count) return rows
+        await delay(10)
+      }
+      assert.fail(`未收到 ${count} 条缓存键保留摘要`)
+    },
     async request(body = history, headers = {}, options = {}) {
       const response = await fetch(`${url}${options.path ?? '/v1/responses'}`, {
         method: 'POST', signal: options.signal ?? AbortSignal.timeout(12000),
@@ -187,6 +196,227 @@ async function fixture(t, respond, settings = policy(), extraEnv = {}, startupOn
   }
 }
 
+for (const client of ['claude', 'codex']) {
+  for (const carrier of ['http', 'json', 'sse']) {
+    test(`保留缓存键 ${client}/${carrier} 连续限流及后续请求均不改键或身份`, async t => {
+      const body = { model: 'fixture-model', store: false, prompt_cache_key: 'client-owned-cache',
+        input: [{ type: 'message', role: 'user', content: 'unchanged fixture' }] }
+      const raw = JSON.stringify(body, null, 2)
+      const headers = { 'x-relay-client': client,
+        'user-agent': client === 'codex' ? 'codex_cli_rs/fixture' : 'claude-cli/fixture',
+        'session-id': 'unchanged-session', originator: 'fixture-client' }
+      const seenHeaders = []
+      const f = await fixture(t, (_, count, req) => {
+        seenHeaders.push({ ...req.headers })
+        return count <= 3 ? classificationError('exceeded token rate limit', carrier,
+          'rate_limit_exceeded', 'too_many_requests', 429) : success
+      }, policy({ stripItemIds: false }))
+      assert.equal((await f.request(raw, headers)).status, 200)
+      assert.equal(f.captured.length, 4)
+      assert.equal((await f.request(raw, headers)).status, 200)
+      assert.equal(f.captured.length, 5)
+      for (const item of f.captured) assert.equal(item.raw, raw, '不能换键或因换键重新序列化')
+      for (const seen of seenHeaders) {
+        for (const name of ['user-agent', 'session-id', 'originator']) assert.equal(seen[name], headers[name])
+        assert.equal(seen.authorization, 'Bearer policy-fixture-only-not-a-key')
+      }
+    })
+  }
+}
+
+test('请求诊断：正常请求恰有一份脱敏摘要作同期对照', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
+  const f = await fixture(t, () => success, policy({ stripItemIds: false }))
+  assert.equal((await f.request(body)).status, 200)
+  const [summary] = await f.summaries()
+  assert.equal(summary.attempts, 1)
+  assert.equal(summary.rateErrors, 0)
+  assert.equal(summary.otherErrors, 0)
+  assert.equal(summary.result, 'json_returned')
+  assert.equal(summary.inputBytes, Buffer.byteLength(JSON.stringify(body)))
+  assert.equal(summary.inputItems, 4)
+  assert.equal(summary.policyGroup, 'codex')
+  assert.match(summary.modelHash, /^[a-f0-9]{64}$/)
+  for (const key of ['initialRoute', 'scopeHash', 'firstKeyHash', 'lastKeyHash', 'mappingRecorded',
+    'candidatePrepared', 'candidateStartMs', 'remainingBudgetMs', 'beforeAttempts', 'afterAttempts']) {
+    assert.equal(Object.hasOwn(summary, key), false, `新摘要不得保留换键字段 ${key}`)
+  }
+  assert.equal(summary.usageShape, 'missing')
+  assert.equal(summary.usageInputTokens, null)
+  assert.equal(f.diagnostics().filter(row => row.event === 'request_summary').length, 1)
+  assert.ok(Buffer.byteLength(JSON.stringify(summary)) <= 2048)
+  const text = JSON.stringify(summary)
+  for (const secret of ['private-cache-key-fixture', 'policy-fixture-only-not-a-key', 'classification fixture prompt', 'fixture-model']) {
+    assert.ok(!text.includes(secret), `摘要不得记录 ${secret}`)
+  }
+  assert.deepEqual(f.captured.map(item => item.body), [body])
+})
+
+test('请求诊断：普通短期限流保留请求并记录全部尝试', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
+  const limited = classificationError('Your requests in eastus2 have exceeded token rate limit.',
+    'http', 'rate_limit_exceeded', 'too_many_requests', 429)
+  const f = await fixture(t, (_, count) => count <= 2 ? limited : success, policy({ stripItemIds: false }))
+  assert.equal((await f.request(body)).status, 200)
+  assert.deepEqual(f.captured.map(item => item.body), [body, body, body])
+  const [summary] = await f.summaries()
+  assert.equal(summary.attempts, 3)
+  assert.equal(summary.rateErrors, 2)
+  assert.equal(summary.otherErrors, 0)
+  assert.equal(summary.rateFirstClass, 'token_rate')
+  assert.equal(summary.rateLastClass, 'token_rate')
+  assert.equal(summary.rateClassMixed, false)
+  assert.equal(summary.result, 'json_returned')
+  assert.equal(summary.waitHintSeen, 2)
+  assert.equal(summary.waitHintValid, 0)
+  assert.equal(summary.waitHintInvalid, 0)
+})
+
+test('请求诊断：限流子类与等待提示只观察、不改变原重试', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
+  const tokenLimited = { ...classificationError('Your requests in eastus2 have exceeded token rate limit.',
+    'http', 'rate_limit_exceeded', 'too_many_requests', 429), headers: { 'retry-after-ms': '2500' } }
+  const capacityLimited = { ...classificationError('The service is temporarily unable to process your request; system is experiencing high demand.',
+    'http', 'rate_limit_exceeded', 'too_many_requests', 429), headers: { 'retry-after-ms': 'soon' } }
+  const f = await fixture(t, (_, count) => [tokenLimited, capacityLimited, success][count - 1], policy({ stripItemIds: false }))
+  assert.equal((await f.request(body)).status, 200)
+  const [summary] = await f.summaries()
+  assert.equal(summary.rateFirstClass, 'token_rate')
+  assert.equal(summary.rateLastClass, 'capacity')
+  assert.equal(summary.rateClassMixed, true)
+  assert.equal(summary.waitHintSeen, 2)
+  assert.equal(summary.waitHintValid, 1)
+  assert.equal(summary.waitHintInvalid, 1)
+  assert.equal(summary.waitHintMaxMs, 2500)
+  assert.equal(summary.attempts, 3)
+  assert.equal(summary.rateErrors, 2)
+  assert.ok(summary.elapsedMs < 1000, '等待提示不得额外拖慢请求')
+})
+
+test('请求诊断：预算内耗尽如实记录次数且不改键', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
+  const limited = classificationError('Your requests in eastus2 have exceeded token rate limit.',
+    'http', 'rate_limit_exceeded', 'too_many_requests', 429)
+  const f = await fixture(t, () => limited,
+    policy({ stripItemIds: false, totalBudgetMs: 1000, connectTimeoutMs: 1000, maxDelayMs: 300000 }))
+  assert.equal((await f.request(body)).status, 429)
+  const [summary] = await f.summaries()
+  assert.equal(summary.attempts, 5)
+  assert.equal(summary.rateErrors, 5)
+  assert.equal(summary.result, 'retry_exhausted')
+  for (const item of f.captured) assert.deepEqual(item.body, body)
+})
+
+test('请求诊断：持续十二次限流仍保留原键并汇总错误', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
+  const limited = classificationError('Your requests in eastus2 have exceeded token rate limit.',
+    'http', 'rate_limit_exceeded', 'too_many_requests', 429)
+  const f = await fixture(t, (_, count) => count <= 12 ? limited : success,
+    policy({ stripItemIds: false, maxAttempts: 20 }))
+  assert.equal((await f.request(body)).status, 200)
+  assert.equal(f.captured.length, 13)
+  for (const item of f.captured) assert.deepEqual(item.body, body)
+  const [summary] = await f.summaries()
+  assert.equal(summary.rateErrors, 12)
+  assert.equal(summary.attempts, 13)
+  assert.equal(summary.result, 'json_returned')
+})
+
+test('请求诊断：只取已有终态里的用量，缺失不补零', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
+  const withUsage = { status: 200, body: { object: 'response', ok: true,
+    usage: { input_tokens: 120, output_tokens: 30, input_tokens_details: { cached_tokens: 80 } } } }
+  const f = await fixture(t, () => withUsage, policy({ stripItemIds: false }))
+  assert.equal((await f.request(body)).status, 200)
+  const [summary] = await f.summaries()
+  assert.equal(summary.usageShape, 'responses')
+  assert.equal(summary.usageInputTokens, 120)
+  assert.equal(summary.usageOutputTokens, 30)
+  assert.equal(summary.usageCachedTokens, 80)
+  assert.equal(summary.usageCacheReadTokens, null)
+  assert.equal(summary.usageCacheCreationTokens, null)
+})
+
+test('请求诊断：流式摘要区分首次交付与完整结束并保留终态用量', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
+  const stream = [
+    'data: {"type":"response.created","response":{}}\n\n',
+    'data: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+    'data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":7}}}}\n\n',
+  ].join('')
+  const f = await fixture(t, () => ({ status: 200, type: 'text/event-stream', body: stream }), policy({ stripItemIds: false }))
+  assert.equal((await f.request(body)).status, 200)
+  const [summary] = await f.summaries()
+  assert.equal(summary.result, 'stream_completed')
+  assert.equal(summary.terminalKind, 'response.completed')
+  assert.ok(summary.firstContentMs >= 0)
+  assert.ok(summary.firstContentMs <= summary.elapsedMs)
+  assert.equal(summary.usageShape, 'responses')
+  assert.equal(summary.usageInputTokens, 10)
+  assert.equal(summary.usageCachedTokens, 7)
+  assert.equal(Object.hasOwn(summary, 'mappingRecorded'), false)
+})
+
+test('请求诊断：流式下发后失败不冒充完整完成', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
+  const stream = [
+    'data: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+    'data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"fixture failure"}}}\n\n',
+  ].join('')
+  const f = await fixture(t, () => ({ status: 200, type: 'text/event-stream', body: stream }), policy({ stripItemIds: false }))
+  await f.request(body)
+  const [summary] = await f.summaries()
+  assert.equal(summary.result, 'stream_failed')
+  assert.equal(summary.terminalKind, 'response.failed')
+  assert.equal(Object.hasOwn(summary, 'mappingRecorded'), false)
+})
+
+test('请求诊断：并发请求各自独立，作用域不串', async t => {
+  const f = await fixture(t, () => success, policy({ stripItemIds: false }))
+  const bodies = ['concurrent-a', 'concurrent-b'].map(prompt_cache_key => ({ ...toolHistory, prompt_cache_key }))
+  const replies = await Promise.all(bodies.map(body => f.request(body)))
+  assert.deepEqual(replies.map(reply => reply.status), [200, 200])
+  const rows = await f.summaries(2)
+  assert.equal(new Set(rows.map(row => row.requestId)).size, 2)
+  assert.ok(rows.every(row => row.attempts === 1 && row.rateErrors === 0))
+  assert.deepEqual(f.captured.map(item => item.body.prompt_cache_key).sort(), ['concurrent-a', 'concurrent-b'])
+})
+
+test('请求诊断：非 Responses 端点不生成摘要', async t => {
+  const f = await fixture(t, () => success, policy({ stripItemIds: false }))
+  assert.equal((await f.request({ model: 'fixture-model', messages: [] }, {}, { path: '/v1/chat/completions' })).status, 200)
+  await delay(80)
+  assert.equal(f.diagnostics().filter(row => row.event === 'request_summary').length, 0)
+})
+
+test('请求诊断：等待重试中取消不冒充已尝试', async t => {
+  const body = { ...toolHistory, prompt_cache_key: 'private-cache-key-fixture' }
+  const limited = classificationError('Your requests in eastus2 have exceeded token rate limit.',
+    'http', 'rate_limit_exceeded', 'too_many_requests', 429)
+  const f = await fixture(t, () => limited,
+    policy({ stripItemIds: false, baseDelayMs: 500, maxDelayMs: 500 }))
+  const controller = new AbortController()
+  const pending = f.request(body, {}, { signal: controller.signal }).catch(() => null)
+  const deadline = Date.now() + 3000
+  let waiting
+  while (Date.now() < deadline) {
+    waiting = (await f.status()).requests?.find(item => item.phase === 'retry_waiting')
+    if (waiting) break
+    await delay(10)
+  }
+  assert.ok(waiting, '网关应报告真实等待重试阶段')
+  assert.equal(waiting.attempt, 1, '计划重试不能提前计为实际发送')
+  controller.abort()
+  assert.equal(await pending, null)
+  const [summary] = await f.summaries()
+  assert.equal(summary.attempts, 1)
+  assert.equal(summary.rateErrors, 1)
+  assert.equal(summary.result, 'cancelled')
+  await delay(550)
+  assert.equal(f.captured.length, 1)
+  assert.equal((await f.status()).activeRequests, 0)
+})
+
 const bindingMessage = 'session binding invalidated: the model this session is bound to can no longer serve it; restart the task with a new session id [trace_id=fixture code=30013]'
 const bindingHistory = {
   ...history, prompt_cache_key: 'fixture-cache', client_metadata: { session_id: 'fixture-session', thread_id: 'fixture-thread' },
@@ -200,7 +430,7 @@ const bindingHistory = {
 }
 const bindingIdsOnly = { ...bindingHistory, input: bindingHistory.input.map(({ id, ...item }) => item) }
 
-test('Claude 缓存路由限流仅换缓存键并记住成功路由', async t => {
+test('Claude 缓存键保留不会因上游拒绝原键而生成或记忆替代键', async t => {
   const seenHeaders = []
   const f = await fixture(t, (body, count, req) => {
     seenHeaders.push({ ...req.headers })
@@ -209,17 +439,11 @@ test('Claude 缓存路由限流仅换缓存键并记住成功路由', async t =>
       : success
   })
   const headers = { 'x-relay-client': 'claude', 'user-agent': 'claude-cli/fixture', 'session-id': 'native-session' }
-  assert.equal((await f.request(bindingHistory, headers)).status, 200)
-  assert.equal(f.captured.length, 3)
-  assert.deepEqual(f.captured[0].body, bindingHistory)
-  assert.deepEqual(f.captured[1].body, bindingHistory)
-  const newKey = f.captured[2].body.prompt_cache_key
-  assert.notEqual(newKey, bindingHistory.prompt_cache_key)
-  assert.ok(newKey.length <= 64)
-  assert.deepEqual(f.captured[2].body, { ...bindingHistory, prompt_cache_key: newKey })
-  assert.equal((await f.request(bindingHistory, headers)).status, 200)
-  assert.equal(f.captured.length, 4)
-  assert.deepEqual(f.captured[3].body, f.captured[2].body)
+  for (let request = 0; request < 2; request++) {
+    assert.equal((await f.request(bindingHistory, headers)).status, 429)
+    assert.equal(f.captured.length, (request + 1) * 5)
+  }
+  for (const item of f.captured) assert.deepEqual(item.body, bindingHistory)
   for (const captured of seenHeaders) {
     assert.equal(captured['session-id'], 'native-session')
     assert.equal(captured['user-agent'], 'claude-cli/fixture')
@@ -230,19 +454,19 @@ const cacheRateError = carrier => classificationError('Your requests in eastus2 
 const claudeCacheHeaders = { 'x-relay-client': 'claude', 'user-agent': 'claude-cli/fixture' }
 
 for (const carrier of ['http', 'json']) {
-  test(`Claude 缓存路由 ${carrier} 限流与 SSE 使用同一恢复边界`, async t => {
+  test(`Claude 缓存键保留 ${carrier} 限流与 SSE 使用同一恢复边界`, async t => {
     const completed = 'data: {"type":"response.output_text.delta","delta":"OK"}\n\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n'
     const f = await fixture(t, body => body.prompt_cache_key === 'fixture-cache'
       ? cacheRateError(carrier) : { status: 200, type: 'text/event-stream', body: completed })
-    assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).body, completed)
-    assert.equal(f.captured.length, 3)
-    assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).body, completed)
-    assert.equal(f.captured.length, 4)
-    assert.deepEqual(f.captured[3].body, f.captured[2].body)
+    assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).status, 429)
+    assert.equal(f.captured.length, 5)
+    assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).status, 429)
+    assert.equal(f.captured.length, 10)
+    for (const item of f.captured) assert.deepEqual(item.body, bindingHistory)
   })
 }
 
-test('Claude 缓存路由一次限流恢复不改请求', async t => {
+test('Claude 缓存键保留一次限流恢复不改请求', async t => {
   const f = await fixture(t, (_, count) => count === 1 ? cacheRateError('sse') : success)
   assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).status, 200)
   assert.equal(f.captured.length, 2)
@@ -253,7 +477,7 @@ for (const headers of [
   { 'x-relay-client': 'zcode' },
   { 'x-relay-client': '' },
 ]) {
-  test(`Claude 缓存路由不修改其他或冲突客户端 ${JSON.stringify(headers)}`, async t => {
+  test(`Claude 缓存键保留不修改其他或冲突客户端 ${JSON.stringify(headers)}`, async t => {
     const f = await fixture(t, () => cacheRateError('sse'), policy({ maxAttempts: 3, stripItemIds: false }, { maxAttempts: 3 }))
     assert.equal((await f.request(bindingHistory, headers)).status, 429)
     assert.equal(f.captured.length, 3)
@@ -264,27 +488,19 @@ for (const headers of [
 // Codex 同样携带 prompt_cache_key，10-29 现场单笔请求可达 93–110 次重试。
 const codexCacheHeaders = { 'x-relay-client': 'codex', 'user-agent': 'codex_cli_rs/fixture' }
 
-test('Codex 缓存路由限流仅换缓存键并保留历史编号清理', async t => {
-  const f = await fixture(t, (body, count) => body.prompt_cache_key === 'fixture-cache'
-    ? cacheRateError('sse') : success, policy({ stripItemIds: false, rememberSession: false }))
-  assert.equal((await f.request(bindingHistory, codexCacheHeaders)).status, 200)
-  assert.equal(f.captured.length, 3)
-  const newKey = f.captured[2].body.prompt_cache_key
-  assert.ok(newKey.startsWith('ag-relay-'))
-  const stripped = bindingHistory.input.map(({ id, ...item }) => item)
-  assert.equal(f.captured[2].body.input.length, stripped.length)
-  f.captured[2].body.input.forEach((item, i) => {
-    f.captured[2].body.input[i] = item
-  })
-  assert.deepEqual(Object.keys(f.captured[2].body).sort(), ['client_metadata', 'input', 'model', 'prompt_cache_key', 'store'])
-  assert.equal(f.captured[2].body.client_metadata.session_id, 'fixture-session')
-  assert.deepEqual(f.captured[2].body.input.map(x => x.type), stripped.map(x => x.type))
-  assert.equal((await f.request(bindingHistory, codexCacheHeaders)).status, 200)
-  assert.equal(f.captured.length, 4)
-  assert.deepEqual(f.captured[3].body, f.captured[2].body)
+test('Codex 缓存键保留限流仍执行已启用的历史编号清理', async t => {
+  const f = await fixture(t, body => body.prompt_cache_key === 'fixture-cache'
+    ? cacheRateError('sse') : success, policy({ stripItemIds: true, rememberSession: false }))
+  const expected = { ...bindingHistory, input: bindingHistory.input.map(({ id, ...item }) =>
+    ['reasoning', 'web_search_call'].includes(item.type) ? { id, ...item } : item) }
+  for (let request = 0; request < 2; request++) {
+    assert.equal((await f.request(bindingHistory, codexCacheHeaders)).status, 429)
+    assert.equal(f.captured.length, (request + 1) * 5)
+  }
+  for (const item of f.captured) assert.deepEqual(item.body, expected)
 })
 
-test('Codex 缓存路由仍先执行已登记的会话预清理', async t => {
+test('Codex 缓存键保留仍先执行已登记的会话预清理', async t => {
   // 先触发一次明确历史错误完成登记；之后的首发必须沿用记忆里的预清理。
   const f = await fixture(t, (body, count) => count === 1
     ? classificationError('The requested item was created under a different Azure OpenAI resource')
@@ -299,7 +515,7 @@ test('Codex 缓存路由仍先执行已登记的会话预清理', async t => {
   assert.ok(f.captured.at(-1).body.input.every(entry => !Object.hasOwn(entry, 'id')), '预清理必须仍去编号')
 })
 
-test('Codex 缓存路由无缓存键时保持原样', async t => {
+test('Codex 缓存键保留无缓存键时保持原样', async t => {
   const f = await fixture(t, () => cacheRateError('sse'), policy({ maxAttempts: 3 }))
   const { prompt_cache_key, ...withoutKey } = bindingHistory
   assert.equal((await f.request(withoutKey, codexCacheHeaders)).status, 429)
@@ -307,7 +523,7 @@ test('Codex 缓存路由无缓存键时保持原样', async t => {
   for (const item of f.captured) assert.ok(!Object.hasOwn(item.body, 'prompt_cache_key'))
 })
 
-test('Claude 缓存路由未提供缓存键时不凭空添加', async t => {
+test('Claude 缓存键保留未提供缓存键时不凭空添加', async t => {
   const { prompt_cache_key, ...body } = bindingHistory
   const f = await fixture(t, () => cacheRateError('sse'), policy({}, { maxAttempts: 3 }))
   assert.equal((await f.request(body, claudeCacheHeaders)).status, 429)
@@ -315,35 +531,30 @@ test('Claude 缓存路由未提供缓存键时不凭空添加', async t => {
   for (const item of f.captured) assert.deepEqual(item.body, body)
 })
 
-test('Claude 缓存路由每请求只换一次且失败不登记', async t => {
+test('Claude 缓存键保留连续耗尽后下一请求也不改键', async t => {
   const f = await fixture(t, () => cacheRateError('sse'), policy({}, { maxAttempts: 4 }))
   for (let run = 0; run < 2; run++) {
     assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).status, 429)
     const batch = f.captured.slice(run * 4, run * 4 + 4)
     assert.equal(batch.length, 4)
-    assert.equal(batch[0].body.prompt_cache_key, 'fixture-cache')
-    assert.equal(batch[1].body.prompt_cache_key, 'fixture-cache')
-    assert.notEqual(batch[2].body.prompt_cache_key, 'fixture-cache')
-    assert.deepEqual(batch[3].body, batch[2].body)
+    for (const item of batch) assert.deepEqual(item.body, bindingHistory)
   }
 })
 
-test('Claude 缓存路由按凭据模型和原缓存键隔离', async t => {
-  const f = await fixture(t, body => body.prompt_cache_key.startsWith('ag-relay-') ? success : cacheRateError('sse'))
+test('Claude 缓存键保留不同凭据模型和原键互不改写', async t => {
+  const f = await fixture(t, (_, count) => count % 3 === 0 ? success : cacheRateError('sse'))
   const combinations = [
     [bindingHistory, claudeCacheHeaders],
     [bindingHistory, { ...claudeCacheHeaders, authorization: 'Bearer other-fixture-only' }],
     [{ ...bindingHistory, model: 'another-model' }, claudeCacheHeaders],
     [{ ...bindingHistory, prompt_cache_key: 'another-cache' }, claudeCacheHeaders],
   ]
-  const keys = new Set()
   for (const [body, headers] of combinations) {
     const before = f.captured.length
     assert.equal((await f.request(body, headers)).status, 200)
     assert.equal(f.captured.length - before, 3)
-    keys.add(f.captured.at(-1).body.prompt_cache_key)
+    for (const item of f.captured.slice(before)) assert.deepEqual(item.body, body)
   }
-  assert.equal(keys.size, 4)
 })
 
 for (const [name, response] of [
@@ -351,14 +562,14 @@ for (const [name, response] of [
   ['额度', classificationError('insufficient_quota', 'sse', 'insufficient_quota', 'quota_error')],
   ['其他暂时错误', classificationError('server unavailable', 'sse', 'server_error', 'server_error')],
 ]) {
-  test(`Claude 缓存路由不把${name}当成缓存限流`, async t => {
+  test(`Claude 缓存键保留不把${name}当成缓存限流`, async t => {
     const f = await fixture(t, () => response, policy({}, { maxAttempts: 3 }))
     await f.request(bindingHistory, claudeCacheHeaders)
     for (const item of f.captured) assert.deepEqual(item.body, bindingHistory)
   })
 }
 
-test('Claude 缓存路由等待中取消不再发送', async t => {
+test('Claude 缓存键保留等待中取消不再发送', async t => {
   const controller = new AbortController()
   const f = await fixture(t, (_, count) => {
     if (count === 2) setTimeout(() => controller.abort(), 30)
@@ -369,7 +580,7 @@ test('Claude 缓存路由等待中取消不再发送', async t => {
   assert.equal(f.captured.length, 2)
 })
 
-test('Claude 缓存路由已下发内容后限流不重放', async t => {
+test('Claude 缓存键保留已下发内容后限流不重放', async t => {
   const stream = 'data: {"type":"response.output_text.delta","delta":"delivered"}\n\ndata: {"type":"error","error":{"code":"rate_limit_exceeded","message":"token rate limit"}}\n\n'
   const f = await fixture(t, () => ({ status: 200, type: 'text/event-stream', body: stream }))
   assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).body, stream)
@@ -377,31 +588,33 @@ test('Claude 缓存路由已下发内容后限流不重放', async t => {
   assert.deepEqual(f.captured[0].body, bindingHistory)
 })
 
-test('Claude 缓存路由不突破两次尝试上限', async t => {
+test('Claude 缓存键保留不突破两次尝试上限', async t => {
   const f = await fixture(t, () => cacheRateError('sse'), policy({}, { maxAttempts: 2 }))
   assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).status, 429)
   assert.equal(f.captured.length, 2)
   for (const item of f.captured) assert.deepEqual(item.body, bindingHistory)
 })
 
-test('Claude 缓存路由记忆到期不再覆盖原键', async t => {
-  const f = await fixture(t, body => body.prompt_cache_key.startsWith('ag-relay-') ? success : cacheRateError('sse'), policy(), { PROXY_SESSION_COMPAT_TTL_MS: '50' })
+test('Claude 缓存键保留不受历史兼容记忆到期影响', async t => {
+  const f = await fixture(t, (_, count) => count % 3 === 0 ? success : cacheRateError('sse'),
+    policy(), { PROXY_SESSION_COMPAT_TTL_MS: '50' })
   assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).status, 200)
-  const firstKey = f.captured.at(-1).body.prompt_cache_key
   await delay(80)
   assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).status, 200)
   assert.equal(f.captured.length, 6)
-  assert.equal(f.captured[3].body.prompt_cache_key, 'fixture-cache')
-  assert.notEqual(f.captured.at(-1).body.prompt_cache_key, firstKey)
+  for (const item of f.captured) assert.deepEqual(item.body, bindingHistory)
 })
 
-test('Claude 缓存路由记忆遵守容量上限', async t => {
-  const f = await fixture(t, body => body.prompt_cache_key.startsWith('ag-relay-') ? success : cacheRateError('sse'), policy(), { PROXY_SESSION_COMPAT_MAX_KEYS: '1' })
-  assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).status, 200)
-  assert.equal((await f.request({ ...bindingHistory, prompt_cache_key: 'another-cache' }, claudeCacheHeaders)).status, 200)
-  assert.equal((await f.request(bindingHistory, claudeCacheHeaders)).status, 200)
-  assert.equal(f.captured.length, 9)
-  assert.equal(f.captured[6].body.prompt_cache_key, 'fixture-cache')
+test('Claude 缓存键保留不受历史兼容容量及其他原键影响', async t => {
+  const f = await fixture(t, (_, count) => count % 3 === 0 ? success : cacheRateError('sse'),
+    policy(), { PROXY_SESSION_COMPAT_MAX_KEYS: '1' })
+  const requests = [bindingHistory, { ...bindingHistory, prompt_cache_key: 'another-cache' }, bindingHistory]
+  for (const body of requests) {
+    const before = f.captured.length
+    assert.equal((await f.request(body, claudeCacheHeaders)).status, 200)
+    assert.equal(f.captured.length - before, 3)
+    for (const item of f.captured.slice(before)) assert.deepEqual(item.body, body)
+  }
 })
 
 const bindingHeaders = {

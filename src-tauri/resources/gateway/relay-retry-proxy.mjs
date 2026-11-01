@@ -276,6 +276,11 @@ function isReasoningItemError(text) {
   return REASONING_ITEM_TEXT.test(String(text || ''));
 }
 
+// The upstream explicitly asks for a conversation without prior encrypted reasoning.
+// Both phrases are required: "unavailable" alone is also used by ordinary 503s.
+const ACCOUNT_REASONING_BOUND_TEXT = /\bupstream account bound to this conversation\b/i;
+const WITHOUT_ENCRYPTED_REASONING_TEXT = /\bwithout previous encrypted reasoning items\b/i;
+
 // Only admitted by the strict Codex branch; other clients keep their existing policy.
 const MISSING_SEARCH_REASONING_TEXT =
   /\bitem ['"]ws_[^'"\r\n]+['"] of type ['"]web_search_call['"] was provided without its required ['"]reasoning['"] item:\s*['"]rs_[^'"\r\n]+['"]/i;
@@ -551,27 +556,6 @@ const compatibilityKeys = new Map();
 // Codex fallback entries must neither affect nor evict the other clients' entries.
 const codexCompatibilityKeys = new Map();
 const fingerprint = (value) => createHash('sha256').update(value).digest('hex');
-// Cache affinity is not conversation identity. Keep only scoped hashes and generated keys.
-const cacheRouteKeys = new Map();
-// Anthropic 与 Codex 两条通道都观察到同一份 prompt_cache_key 被持续拒绝；
-// 冲突或未知客户端、无缓存键的请求保持原样。
-function cacheRouteIdentity(bodyBuf, headers) {
-  const explicit = String(headers['x-relay-client'] || '').trim().toLowerCase();
-  const ua = String(headers['user-agent'] || '').toLowerCase();
-  const claude = explicit === 'claude' || (!explicit && ua.includes('claude'));
-  if (!claude && !strictCodex(headers)) return null;
-  let obj;
-  try { obj = JSON.parse(bodyBuf.toString('utf8')); } catch { return null; }
-  if (!obj || typeof obj !== 'object' || Array.isArray(obj) || !nonEmptyStr(obj.prompt_cache_key)) return null;
-  return fingerprint(JSON.stringify([cfg.upstream, headers.authorization || '',
-    headers['x-api-key'] || '', headers['api-key'] || '', obj.model || '', obj.prompt_cache_key]));
-}
-function withCacheRouteKey(bodyBuf, key) {
-  const obj = JSON.parse(bodyBuf.toString('utf8'));
-  obj.prompt_cache_key = key;
-  return Buffer.from(JSON.stringify(obj), 'utf8');
-}
-
 function compatibilityIdentity(bodyBuf, headers, enabled = cfg.sessionCompat) {
   if (!enabled) return null;
   let obj;
@@ -752,14 +736,16 @@ function isRetryableError(info) {
 function classifyError(info, status = 200) {
   const message = errorCauseText(info?.message);
   const evidence = info ? { code: info.code, type: info.type, message } : null;
-  const quota = status === 402 || isQuotaError(evidence);
-  const permanent = quota || status === 401 || status === 403 || isDeterministicError(evidence);
-  const deployment = !permanent && isDeploymentError(evidence);
-  const retryable = !permanent && (deployment || status === 408 || status === 429 || status >= 500 || isRetryableError(info));
+  let quota = status === 402 || isQuotaError(evidence);
+  let permanent = quota || status === 401 || status === 403 || isDeterministicError(evidence);
+  let deployment = !permanent && isDeploymentError(evidence);
+  let retryable = !permanent && (deployment || status === 408 || status === 429 || status >= 500 || isRetryableError(info));
   let kind = permanent ? (quota ? 'quota' : 'permanent') : deployment ? 'deployment' : retryable ? 'retryable' : 'unknown';
   const sessionBindingInvalidated = kind === 'unknown' && [200, 400, 409].includes(status)
     && (String(info?.code || '').toLowerCase() === 'session_binding_invalidated'
       || /\bsession binding invalidated\b[\s\S]*\bnew session id\b/i.test(message));
+  const accountReasoningUnavailable = [200, 400, 409].includes(status)
+    && ACCOUNT_REASONING_BOUND_TEXT.test(message) && WITHOUT_ENCRYPTED_REASONING_TEXT.test(message);
   let historyKind = null;
   let missingSearchReasoning = false;
   let statusIndex = null;
@@ -777,6 +763,17 @@ function classifyError(info, status = 200) {
         historyKind = azure ? 'azure_resource_mismatch' : 'stale_reasoning_item';
       }
     }
+  }
+  // This message contains "unavailable", so it would otherwise be a generic retryable
+  // error. Only the two explicit phrases together (and only on 200/400/409) enter the
+  // bounded history repair; ordinary 503/429 wording never changes the request body.
+  if (accountReasoningUnavailable) {
+    kind = 'history';
+    historyKind = 'account_reasoning_unavailable';
+    permanent = false;
+    quota = false;
+    retryable = false;
+    deployment = false;
   }
   return { kind, info, message, permanent, quota, deployment, retryable, historyKind, missingSearchReasoning, statusIndex, sessionBindingInvalidated };
 }
@@ -831,10 +828,103 @@ function strictCodex(headers) {
   return explicit === 'codex' || /^codex(?:_cli_rs|_vscode|_desktop)?(?:\/|\s|$)/.test(ua);
 }
 
-function requestProfile(bodyBuf, headers) {
+// Request-local observations never participate in retry or routing decisions.
+function observeRequest(state, method, ...args) {
+  try { state.requestObservation?.[method](...args); } catch { /* Diagnostics must not fail requests. */ }
+}
+
+// Only finite diagnoses drawn from the existing error evidence; never a verdict on a route.
+function rateSubclass(classification) {
+  const info = classification?.info;
+  const code = String(info?.code || info?.type || '').toLowerCase();
+  if (code !== 'rate_limit_exceeded') return null;
+  const message = errorCauseText(info?.message).toLowerCase();
+  const matches = [];
+  if (/\btoken rate limit\b|\btokens? per minute\b|\btpm\b/.test(message)) matches.push('token_rate');
+  if (/\btoo many requests\b|\brequests? per minute\b|\brpm\b|\brequest rate limit\b|\brequests? to\b[^\n]*\bhave been limited\b/.test(message)) matches.push('request_rate');
+  if (/\bcapacity\b|\bhigh demand\b|\btemporarily unable to process\b|\boverload(?:ed)?\b/.test(message)) matches.push('capacity');
+  if (!matches.length) return 'unknown';
+  return matches.length === 1 ? matches[0] : 'mixed';
+}
+
+function createRequestObservation(state, policyGroup) {
+  const record = {
+    observationVersion: 1, client: 'unknown', policyGroup,
+    inputBytes: null, inputItems: null, modelHash: null,
+    attempts: 0, rateErrors: 0, otherErrors: 0,
+    rateFirstClass: 'none', rateLastClass: 'none', rateClassMixed: false,
+    waitHintSeen: 0, waitHintValid: 0, waitHintMaxMs: null, waitHintInvalid: 0,
+    firstContentMs: null, result: 'unknown', terminalKind: null,
+    usageShape: 'missing', usageInputTokens: null, usageOutputTokens: null,
+    usageCachedTokens: null, usageCacheReadTokens: null, usageCacheCreationTokens: null,
+  };
+  let finalized = false;
+  const elapsed = () => Math.max(0, Date.now() - state.started);
+  const setRateClass = (value) => {
+    record.rateLastClass = value;
+    if (record.rateFirstClass === 'none') record.rateFirstClass = value;
+    else if (record.rateFirstClass !== value) record.rateClassMixed = true;
+  };
+  return {
+    profile(obj, headers, bytes) {
+      record.client = clientClass(headers);
+      record.inputBytes = bytes;
+      record.inputItems = Array.isArray(obj.input) ? obj.input.length : null;
+      record.modelHash = typeof obj.model === 'string' ? fingerprint(obj.model) : null;
+    },
+    attempt() { record.attempts++; },
+    failure(classification, headers) {
+      const rate = rateSubclass(classification);
+      if (rate) {
+        setRateClass(rate);
+        record.rateErrors++;
+      } else record.otherErrors++;
+      record.waitHintSeen++;
+      const get = (name) => (headers && typeof headers.get === 'function') ? headers.get(name) : headers?.[name];
+      const msRaw = get('retry-after-ms');
+      const secRaw = get('retry-after');
+      const raw = msRaw != null ? msRaw : secRaw != null ? String(secRaw).trim() : null;
+      const ms = raw === null || raw === '' ? null : Number(raw) * (msRaw != null ? 1 : 1000);
+      if (ms === null) return;
+      if (Number.isFinite(ms) && ms >= 0) {
+        record.waitHintValid++;
+        record.waitHintMaxMs = Math.max(record.waitHintMaxMs ?? 0, Math.floor(ms));
+      } else {
+        record.waitHintInvalid++;
+      }
+    },
+    result(value) { record.result = value; },
+    terminal(value) { record.terminalKind = value ?? null; },
+    firstContent() { if (record.firstContentMs === null) record.firstContentMs = elapsed(); },
+    usage(value) {
+      if (!value || typeof value !== 'object') return;
+      const wrapped = value.response && typeof value.response === 'object' ? value.response : null;
+      const u = wrapped?.usage || value.usage;
+      if (!u || typeof u !== 'object') return;
+      const finite = (v) => Number.isFinite(v) ? v : null;
+      if (record.usageShape === 'missing') record.usageShape = wrapped || value.object === 'response' ? 'responses' : 'chat';
+      record.usageInputTokens = finite(u.input_tokens) ?? record.usageInputTokens;
+      record.usageOutputTokens = finite(u.output_tokens) ?? record.usageOutputTokens;
+      const cached = u.input_tokens_details?.cached_tokens ?? u.prompt_tokens_details?.cached_tokens;
+      if (Number.isFinite(cached)) record.usageCachedTokens = cached;
+      if (Number.isFinite(u.cache_read_input_tokens)) record.usageCacheReadTokens = u.cache_read_input_tokens;
+      if (Number.isFinite(u.cache_creation_input_tokens)) record.usageCacheCreationTokens = u.cache_creation_input_tokens;
+    },
+    finish(res) {
+      if (finalized) return;
+      finalized = true;
+      safeDiagnostic({ requestId: state.requestId, event: 'request_summary', path: state.path,
+        attempt: state.attempt, ...record, status: res.headersSent ? res.statusCode : null,
+        elapsedMs: elapsed() });
+    },
+  };
+}
+
+function requestProfile(bodyBuf, headers, observationState) {
   let obj;
   try { obj = JSON.parse(bodyBuf.toString('utf8')); } catch { return { body: 'invalid_json' }; }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return { body: 'non_object' };
+  if (observationState) observeRequest(observationState, 'profile', obj, headers, bodyBuf.length);
   const present = Object.keys(obj);
   const bool = (v) => (typeof v === 'boolean' ? String(v) : 'other');
   const include = !Object.hasOwn(obj, 'include') ? 'absent'
@@ -1102,6 +1192,7 @@ async function peekAndCommit(upstream, res, onCommit = () => {}, state, codexRes
   const commit = () => {
     committed = true;
     lastProgress = Date.now();
+    observeRequest(state, 'firstContent');
     onCommit();
     state.phase = 'stream_waiting';
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' });
@@ -1170,6 +1261,7 @@ async function peekAndCommit(upstream, res, onCommit = () => {}, state, codexRes
         if (payload.done) { sawTerminal = true; terminalKind = 'done_marker'; stopReading = true; continue; }
         if (!payload.obj) continue;
         const err = errorInfoFromJson(payload.obj);
+        if (payload.obj.usage || payload.obj.response?.usage) observeRequest(state, 'usage', payload.obj);
         if (err && !committed) {
           streamError = err;
           return failure(`HTTP 200 but stream carried error: ${err.code || ''} ${err.message}`, 'stream_error');
@@ -1233,7 +1325,7 @@ async function handle(req, res, state) {
     attempt: attemptCount, repairCount, ...fields });
   res.setHeader('x-relay-request-id', requestId);
   res.once('finish', () => diagnose('finished', { status: res.statusCode }));
-  res.once('close', () => { if (!res.writableFinished) diagnose('client_closed'); });
+  res.once('close', () => { if (!res.writableFinished) { observeRequest(state, 'result', 'cancelled'); diagnose('client_closed'); } });
   if (res.destroyed || req.aborted) return;
   const ac = new AbortController();
   res.once('close', () => { if (!res.writableFinished) ac.abort(); });
@@ -1279,15 +1371,16 @@ async function handle(req, res, state) {
   // 110 次形同虚设）。没报过历史错误的请求按通用预算重试。
   let historyRepairApplied = false;
   let bindingIdRepairApplied = false;
+  let accountReasoningRetries = 0;
   let postRepairSends = 0;
   let frozenHistoryKind = null;
   diagnose('received', isResponses ? { shape: summarizeResponsesBody(body) } : {});
-  if (isResponses) diagnose('request_profile', requestProfile(body, headers));
+  if (isResponses) state.requestObservation = createRequestObservation(state, eligibleCodex ? 'codex' : 'general');
+  if (isResponses) diagnose('request_profile', requestProfile(body, headers, state));
   // Keep Codex fallback memory separate; other clients retain their existing policy.
   const compatibilityCache = eligibleCodex ? codexCompatibilityKeys : compatibilityKeys;
   const compatibility = isResponses ? compatibilityIdentity(body, headers,
     policy.rememberSession && policy.historyMode === 'on_error') : null;
-  const cacheRoute = isResponses ? cacheRouteIdentity(body, headers) : null;
   delete headers['x-relay-session-id'];
   delete headers['x-relay-client'];
   if (isResponses && policy.historyMode === 'always') {
@@ -1335,48 +1428,20 @@ async function handle(req, res, state) {
       }
     }
   }
-  // Reuse a proven replacement rather than paying for a new cold cache on every turn.
-  if (cacheRoute) {
-    for (const [key, entry] of cacheRouteKeys) if (entry.expires <= Date.now()) cacheRouteKeys.delete(key);
-  }
-  let cacheRouteKey = cacheRoute ? cacheRouteKeys.get(cacheRoute)?.key : null;
-  if (cacheRouteKey) activeBody = withCacheRouteKey(activeBody, cacheRouteKey);
-  let cacheRateFailures = 0;
-  let cacheRouteChanged = false;
   // 上限可随着「通道类抖动」动态放宽
   let maxAttempts = policy.maxAttempts;
   const deadline = Date.now() + policy.totalBudgetMs;
   const outOfBudget = () => Date.now() >= deadline;
   // A capped attempt must not spend another backoff interval before discovering the cap.
-  const retrySleep = (ms) => eligibleCodex && historyRepairApplied && postRepairSends >= 3
-    ? Promise.resolve() : sleep(ms, ac.signal);
+  const retrySleep = (ms) => {
+    if (eligibleCodex && historyRepairApplied && postRepairSends >= 3) return Promise.resolve();
+    if (!ac.signal.aborted) state.phase = 'retry_waiting';
+    return sleep(ms, ac.signal);
+  };
   // 大请求（长对话）要等更久才等到首个响应头
   const attemptTimeoutMs = connectTimeoutFor(body.length, policy.totalBudgetMs, policy.connectTimeoutMs);
   log(`incoming ${req.method} ${req.url} body=${(body.length / 1024).toFixed(0)}KB ` +
       `waitHeader=${Math.round(attemptTimeoutMs / 1000)}s budget=${Math.round(policy.totalBudgetMs / 1000)}s`);
-
-  // A sticky upstream cache route can rate-limit indefinitely despite fresh connections.
-  // Two explicit rate errors permit one new cache key, never a new session or lost history.
-  const noteCacheRateLimit = (classification, attempt) => {
-    if (!cacheRoute || cacheRouteChanged) return;
-    if (classification.permanent || !classification.retryable ||
-        String(classification.info?.code || '').toLowerCase() !== 'rate_limit_exceeded') {
-      cacheRateFailures = 0;
-      return;
-    }
-    if (++cacheRateFailures < 2 || attempt >= maxAttempts || ac.signal.aborted ||
-        deadline - Date.now() < cfg.minRetryWindowMs + policy.maxDelayMs) return;
-    cacheRouteKey = `ag-relay-${randomUUID()}`;
-    activeBody = withCacheRouteKey(activeBody, cacheRouteKey);
-    cacheRouteChanged = true;
-    log('repeated rate limit: trying one fresh cache route; history and session identity retained');
-  };
-  const rememberCacheRoute = () => {
-    if (!cacheRoute || !cacheRouteKey) return;
-    cacheRouteKeys.delete(cacheRoute);
-    cacheRouteKeys.set(cacheRoute, { key: cacheRouteKey, expires: Date.now() + cfg.sessionCompatTtlMs });
-    while (cacheRouteKeys.size > cfg.sessionCompatMaxKeys) cacheRouteKeys.delete(cacheRouteKeys.keys().next().value);
-  };
 
   const handleStatusError = (classification, attempt, source, status) => {
     if (!policy.repairStatus || classification.kind !== 'status') return null;
@@ -1450,6 +1515,39 @@ async function handle(req, res, state) {
       classification.retryable = false;
       diagnose('repair_refused', { kind: classification.historyKind, source, status, refusal: 'repair_exhausted' });
       return null;
+    }
+    if (classification.kind === 'history' && classification.historyKind === 'account_reasoning_unavailable') {
+      // Client-agnostic: both Claude and Codex Responses can receive this account message.
+      // Remove prior encrypted reasoning once, then allow at most two retries in this request.
+      const kind = classification.historyKind;
+      diagnose('item_error', { kind, source, status, shape: summarizeResponsesBody(activeBody) });
+      const stop = (reason, refusal = 'repair_exhausted') => {
+        diagnose('repair_refused', { kind, source, status, refusal });
+        log(`attempt ${attempt}: ${kind}: ${reason}; not retrying`);
+        sendPermanent(res, `${kind}: the upstream account bound to this conversation is unavailable even after removing previous encrypted reasoning and retrying ${accountReasoningRetries} time(s).`);
+        return 'stop';
+      };
+      if (policy.historyMode === 'off') return stop('history recovery is disabled by policy');
+      if (preflightRefused) return stop('preflight history failed safety validation', 'unsafe_inline_history');
+      if (!isResponses) return stop('automatic item repair is restricted to POST /v1/responses', 'wrong_endpoint');
+      if (accountReasoningRetries >= 2) return stop('two retries exhausted');
+      if (deadline - Date.now() < cfg.minRetryWindowMs + cfg.deployDelayMs) return stop('insufficient time budget', 'time_budget');
+      if (accountReasoningRetries === 0) {
+        const repaired = repairResponsesItems(activeBody, {
+          stripItemIds: eligibleCodex, dropReasoning: true, codexHistory: eligibleCodex,
+        });
+        if (repaired.error) return stop(repaired.error, 'unsafe_inline_history');
+        activeBody = repaired.body;
+        repairedItems = true;
+        repairCount++;
+        maxAttempts = Math.max(maxAttempts, attempt + 2);
+        diagnose('repair_applied', { kind, source, status, removedIds: repaired.removedIds, removedReasoning: repaired.removedReasoning });
+        log(`attempt ${attempt}: ${kind}: removed reasoning=${repaired.removedReasoning}; two retries remain`);
+      } else {
+        log(`attempt ${attempt}: ${kind}: retry ${accountReasoningRetries + 1}/2 with the same repaired request`);
+      }
+      accountReasoningRetries++;
+      return 'retry';
     }
     if (classification.kind !== 'history' || (classification.missingSearchReasoning && !eligibleCodex)) return null;
     const kind = classification.historyKind;
@@ -1589,6 +1687,85 @@ async function handle(req, res, state) {
     }
   };
 
+  // Parse/commit stays with each carrier; recovery ordering and waits live here.
+  // Unknown HTTP/JSON/SSE and final error envelopes deliberately remain distinct.
+  const recoverFailure = async (failure, attempt) => {
+    const { source, status, classification, headers, buffer } = failure;
+    const isHttp = source === 'http_error';
+    const isSse = source === 'sse_precommit';
+    const retry = async (ms) => { await retrySleep(ms); return 'retry'; };
+    observeRequest(state, 'failure', classification, headers);
+    if (isSse) {
+      lastReason = failure.reason;
+      log(`attempt ${attempt}: ${lastReason}`);
+      const fp = errorFingerprint(failure.errorMessage
+        ? { code: failure.errorCode, message: failure.errorMessage } : null);
+      diagnose('precommit_failure', { source, kind: failure.kind,
+        code: fp ? fp.code : 'none', hints: fp ? fp.hints : '',
+        masked: fp ? fp.masked : false, retryable: classification.retryable });
+    }
+    const statusAction = handleStatusError(classification, attempt, source, status);
+    if (statusAction === 'stop') return 'stop';
+    if (statusAction === 'retry') return retry(cfg.deployDelayMs);
+    const itemAction = handleItemError(classification, attempt, source, status);
+    if (itemAction === 'stop') return 'stop';
+    if (itemAction === 'retry') return retry(cfg.deployDelayMs);
+    // Repair refusal may mutate classification; inspect it only after both handlers.
+    if (classification.permanent) {
+      if (isHttp) {
+        lastReason = `HTTP ${status} deterministic error: ${snippet(buffer)}`;
+        log(`attempt ${attempt}: ${lastReason}`);
+        log('  -> deterministic error, not retrying');
+        observeRequest(state, 'result', 'permanent_error');
+        passthrough(res, status, headers, buffer);
+      } else {
+        if (!isSse) {
+          const info = classification.info;
+          lastReason = `HTTP 200 but body was an error: ${info.code || info.type || ''} ${info.message}`;
+          log(`attempt ${attempt}: ${lastReason}`);
+        }
+        log(classification.quota ? '  -> quota exhausted, not retrying'
+          : '  -> permanent error, not retrying');
+        observeRequest(state, 'result', 'permanent_error');
+        sendPermanent(res, lastReason, classification.quota ? 402 : 400);
+      }
+      return 'stop';
+    }
+    if (isHttp && !classification.retryable) {
+      observeRequest(state, 'result', 'error_passthrough');
+      passthrough(res, status, headers, buffer);
+      return 'stop';
+    }
+    if (!isHttp && !isSse && !classification.deployment && !classification.retryable) return 'pass';
+    if (isHttp) lastReason = `HTTP ${status} ${snippet(buffer)}`;
+    else if (!isSse) {
+      const info = classification.info;
+      lastReason = `HTTP 200 but body was an error: ${info.code || ''} ${info.message}`;
+    }
+    if (!isSse) log(`attempt ${attempt}: ${lastReason}`);
+    if (classification.deployment) {
+      maxAttempts = Math.max(maxAttempts, cfg.deployMaxAttempts);
+      if (attempt < maxAttempts) {
+        log('  -> deployment missing on this route, retrying for another route');
+        return retry(cfg.deployDelayMs);
+      }
+      observeRequest(state, 'result', 'retry_exhausted');
+      if (!isSse) {
+        sendRetryable(res, 429, lastReason, attempt, policy);
+        return 'stop';
+      }
+    }
+    if (isSse && failure.kind === 'empty_stream_drop') {
+      notePreCommitFailure(attempt, source);
+      if (attempt < maxAttempts) return retry(cfg.deployDelayMs);
+    }
+    // Unknown SSE remains retryable; known rate errors never trigger history repair.
+    if (attempt < maxAttempts) return retry(backoffMs(attempt, policy));
+    observeRequest(state, 'result', 'retry_exhausted');
+    sendRetryable(res, isHttp && status !== 429 ? 503 : 429, lastReason, attempt, policy);
+    return 'stop';
+  };
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (ac.signal.aborted || res.destroyed) return;
     if (eligibleCodex && historyRepairApplied && postRepairSends >= 3) {
@@ -1602,6 +1779,7 @@ async function handle(req, res, state) {
     if (attempt > 1 && remaining < cfg.minRetryWindowMs) {
       lastReason = `gave up retrying: only ${Math.round(remaining / 1000)}s of budget left`;
       log(`attempt ${attempt}: ${lastReason}`);
+      observeRequest(state, 'result', 'retry_exhausted');
       return sendRetryable(res, 503, lastReason, attempt - 1, policy);
     }
     // 每次尝试独立控制器：既能被客户端断开连带中止，也能被超时单独中止
@@ -1630,6 +1808,7 @@ async function handle(req, res, state) {
         // `connection` 是逐跳头，站点看到的其它请求头与指纹没有任何变化。
         // Count actual fetch calls, even when no HTTP response arrives (network failure).
         if (eligibleCodex && historyRepairApplied) postRepairSends++;
+        observeRequest(state, 'attempt');
         upstream = await fetch(target, {
           method: req.method,
           headers: { ...headers, connection: 'close' },
@@ -1642,6 +1821,7 @@ async function handle(req, res, state) {
         if (outOfBudget()) {
           lastReason = `total budget ${policy.totalBudgetMs}ms exhausted`;
           log(`attempt ${attempt}: ${lastReason}`);
+          observeRequest(state, 'result', 'retry_exhausted');
           return sendRetryable(res, 503, lastReason, attempt, policy);
         }
         lastReason = connectTimedOut
@@ -1651,6 +1831,7 @@ async function handle(req, res, state) {
         // 连接超时/失败属于通道抖动：放宽次数、缩短间隔，快速换通道
         maxAttempts = Math.max(maxAttempts, cfg.deployMaxAttempts);
         if (attempt < maxAttempts) { await retrySleep(cfg.deployDelayMs); continue; }
+        observeRequest(state, 'result', 'retry_exhausted');
         return sendRetryable(res, 502, lastReason, attempt, policy);
       } finally {
         clearTimeout(connectTimer);   // 已拿到响应头，后续由 peek 的读取超时接管
@@ -1665,35 +1846,10 @@ async function handle(req, res, state) {
         let errorInfo = null;
         try { errorInfo = errorInfoFromJson(JSON.parse(text)); }
         catch { errorInfo = { message: text.trim() }; }
-        const classification = classifyError(errorInfo, upstream.status);
-        noteCacheRateLimit(classification, attempt);
-        const statusAction = handleStatusError(classification, attempt, 'http_error', upstream.status);
-        if (statusAction === 'stop') return;
-        if (statusAction === 'retry') { await retrySleep(cfg.deployDelayMs); continue; }
-        const itemAction = handleItemError(classification, attempt, 'http_error', upstream.status);
-        if (itemAction === 'stop') return;
-        if (itemAction === 'retry') { await retrySleep(cfg.deployDelayMs); continue; }
-
-        if (classification.permanent) {
-          lastReason = `HTTP ${upstream.status} deterministic error: ${snippet(buf)}`;
-          log(`attempt ${attempt}: ${lastReason}`);
-          log('  -> deterministic error, not retrying');
-          return passthrough(res, upstream.status, upstream.headers, buf);
-        }
-        if (!classification.retryable) return passthrough(res, upstream.status, upstream.headers, buf);
-        lastReason = `HTTP ${upstream.status} ${snippet(buf)}`;
-        log(`attempt ${attempt}: ${lastReason}`);
-        if (classification.deployment) {
-          maxAttempts = Math.max(maxAttempts, cfg.deployMaxAttempts);
-          if (attempt < maxAttempts) {
-            log('  -> deployment missing on this route, retrying for another route');
-            await retrySleep(cfg.deployDelayMs);
-            continue;
-          }
-          return sendRetryable(res, 429, lastReason, attempt, policy);
-        }
-        if (attempt < maxAttempts) { await retrySleep(backoffMs(attempt, policy)); continue; }
-        return sendRetryable(res, upstream.status === 429 ? 429 : 503, lastReason, attempt, policy);
+        const action = await recoverFailure({ source: 'http_error', status: upstream.status,
+          classification: classifyError(errorInfo, upstream.status), headers: upstream.headers, buffer: buf }, attempt);
+        if (action === 'retry') continue;
+        return;
       }
 
       const ct = (upstream.headers.get('content-type') || '').toLowerCase();
@@ -1702,63 +1858,17 @@ async function handle(req, res, state) {
         state.phase = 'waiting_first_content';
         const outcome = await peekAndCommit(upstream, res, () => diagnose('sse_committed', { status: 200 }), state, clientCodex);
         if (outcome.committed) {
-          if (outcome.terminalKind === 'response.completed') rememberCacheRoute();
+          observeRequest(state, 'terminal', outcome.terminalKind);
+          observeRequest(state, 'result', outcome.terminalKind === 'response.completed' ? 'stream_completed' : 'stream_failed');
           diagnose('sse_ended', { status: 200, sawTerminal: outcome.sawTerminal, terminalKind: outcome.terminalKind, idleAfterCommit: outcome.idleAfterCommit, stallReason: outcome.stallReason });
           if (attempt > 1) log(`attempt ${attempt}: recovered on a later route (previous failures: ${attempt - 1})`);
           return;
         }
         if (ac.signal.aborted) return;
-        lastReason = outcome.reason;
-        const classification = outcome.classification;
-        noteCacheRateLimit(classification, attempt);
-        log(`attempt ${attempt}: ${lastReason}`);
-        // 有界诊断：把「200 流内的失败」分类成固定枚举 + 上游错误指纹（不落盘文案）。
-        // 之前这类失败没有任何诊断记录，只能靠反推，代价很大。
-        {
-          const fp = errorFingerprint(outcome.errorMessage
-            ? { code: outcome.errorCode, message: outcome.errorMessage } : null);
-          diagnose('precommit_failure', {
-            source: 'sse_precommit',
-            kind: outcome.kind,
-            code: fp ? fp.code : 'none',
-            hints: fp ? fp.hints : '',
-            masked: fp ? fp.masked : false,
-            retryable: classification.retryable,
-          });
-        }
-        const statusAction = handleStatusError(classification, attempt, 'sse_precommit', upstream.status);
-        if (statusAction === 'stop') return;
-        if (statusAction === 'retry') { await retrySleep(cfg.deployDelayMs); continue; }
-        const itemAction = handleItemError(classification, attempt, 'sse_precommit', upstream.status);
-        if (itemAction === 'stop') return;
-        if (itemAction === 'retry') { await retrySleep(cfg.deployDelayMs); continue; }
-        if (classification.permanent) {                // 确认的确定性错误：不重试，直接失败
-          log(classification.quota
-            ? '  -> quota exhausted, not retrying (switch model or wait for the pool to refill)'
-            : '  -> permanent error, not retrying');
-          return sendPermanent(res, lastReason, classification.quota ? 402 : 400);
-        }
-        if (classification.deployment) {               // 通道缺部署：放宽次数、缩短间隔，快速换通道
-          maxAttempts = Math.max(maxAttempts, cfg.deployMaxAttempts);
-          if (attempt < maxAttempts) {
-            log('  -> deployment missing on this route, retrying for another route');
-            await retrySleep(cfg.deployDelayMs);
-            continue;
-          }
-        }
-        if (outcome.kind === 'empty_stream_drop') {   // 上游静默丢弃：快速换通道 + 形状修复升级
-          notePreCommitFailure(attempt, 'sse_precommit');
-          if (attempt < maxAttempts) {
-            log('  -> upstream closed the stream with no content, retrying for another route');
-            await retrySleep(cfg.deployDelayMs);
-            continue;
-          }
-        }
-        // 200 流内可重试错误（生产实测 154/154 都是 rate_limit_exceeded）刻意不做形状修复：
-        // 实测把 item id 和 reasoning 都摘干净之后，请求仍然被限流 5~21 次 —— 形状不是触发条件，
-        // 再改请求体只是白白损失推理连续性。这里保持纯重试。
-        if (attempt < maxAttempts) { await retrySleep(backoffMs(attempt, policy)); continue; }
-        return sendRetryable(res, 429, lastReason, attempt, policy);
+        const action = await recoverFailure({ ...outcome, source: 'sse_precommit',
+          status: upstream.status, headers: upstream.headers }, attempt);
+        if (action === 'retry') continue;
+        return;
       }
 
       // 非流式
@@ -1767,38 +1877,11 @@ async function handle(req, res, state) {
       try { obj = JSON.parse(buf.toString('utf8')); } catch { /* 非 JSON */ }
 
       const info = errorInfoFromJson(obj);
-      const classification = classifyError(info);
-      noteCacheRateLimit(classification, attempt);
       if (info) {
-        const statusAction = handleStatusError(classification, attempt, 'json_error', upstream.status);
-        if (statusAction === 'stop') return;
-        if (statusAction === 'retry') { await retrySleep(cfg.deployDelayMs); continue; }
-        const itemAction = handleItemError(classification, attempt, 'json_error', upstream.status);
-        if (itemAction === 'stop') return;
-        if (itemAction === 'retry') { await retrySleep(cfg.deployDelayMs); continue; }
-      }
-      if (classification.permanent) {
-        lastReason = `HTTP 200 but body was an error: ${info.code || info.type || ''} ${info.message}`;
-        log(`attempt ${attempt}: ${lastReason}`);
-        log(classification.quota ? '  -> quota exhausted, not retrying' : '  -> permanent error, not retrying');
-        return sendPermanent(res, lastReason, classification.quota ? 402 : 400);
-      }
-      if (classification.deployment) {    // 通道缺部署：放宽次数、缩短间隔
-        lastReason = `HTTP 200 but body was an error: ${info.code || ''} ${info.message}`;
-        log(`attempt ${attempt}: ${lastReason}`);
-        maxAttempts = Math.max(maxAttempts, cfg.deployMaxAttempts);
-        if (attempt < maxAttempts) {
-          log('  -> deployment missing on this route, retrying for another route');
-          await retrySleep(cfg.deployDelayMs);
-          continue;
-        }
-        return sendRetryable(res, 429, lastReason, attempt, policy);
-      }
-      if (classification.retryable) {
-        lastReason = `HTTP 200 but body was an error: ${info.code || ''} ${info.message}`;
-        log(`attempt ${attempt}: ${lastReason}`);
-        if (attempt < maxAttempts) { await retrySleep(backoffMs(attempt, policy)); continue; }
-        return sendRetryable(res, 429, lastReason, attempt, policy);
+        const action = await recoverFailure({ source: 'json_error', status: upstream.status,
+          classification: classifyError(info), headers: upstream.headers }, attempt);
+        if (action === 'retry') continue;
+        if (action === 'stop') return;
       }
 
       if (obj && isEmptyCompletion(obj)) {      // 空回应
@@ -1810,10 +1893,14 @@ async function handle(req, res, state) {
           await retrySleep(cfg.deployDelayMs);
           continue;
         }
+        observeRequest(state, 'result', 'retry_exhausted');
         return sendRetryable(res, 429, lastReason, attempt, policy);
       }
 
-      if (!info) rememberCacheRoute();
+      if (!info) {
+        observeRequest(state, 'result', 'json_returned');
+        if (obj) observeRequest(state, 'usage', obj);
+      }
       if (attempt > 1) log(`attempt ${attempt}: recovered on a later route (previous failures: ${attempt - 1})`);
       return passthrough(res, 200, upstream.headers, buf);
     } finally {
@@ -2016,6 +2103,7 @@ const server = http.createServer((req, res) => {
   const cleanup = () => {
     if (!handled || !responseDone) return;
     clearInterval(timer);
+    if (state.requestObservation) observeRequest(state, 'finish', res);
     activeRequests.delete(state.requestId);
     finishDrain();
   };

@@ -10,6 +10,7 @@ import type { GatewaySnapshot } from '@/lib/types'
 const phases: Record<string, { title: string; detail: string }> = {
   receiving_request: { title: '正在接收请求', detail: '客户端还在把请求交给网关。' },
   waiting_headers: { title: '等待上游响应', detail: '已向上游服务发送请求，尚未收到响应。' },
+  retry_waiting: { title: '等待重试', detail: '网关正在等待后再试，不是上游正在生成内容；下一次尝试尚未发出。' },
   reading_body: { title: '正在读取回复', detail: '上游已响应，网关正在接收回复内容。' },
   waiting_first_content: { title: '等待首段内容', detail: '上游已连接，还没有返回可交付的内容。' },
   stream_waiting: { title: '等待后续内容', detail: '已开始传回内容，正在等待后续输出。' },

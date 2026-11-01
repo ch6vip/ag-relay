@@ -13,6 +13,7 @@
   const request = { requestId: 'fixture-0001', phase: 'waiting_first_content', attempt: 3, elapsedMs: 65000, sinceLastProgressMs: null }
   const status = { available: true, owner: 'window', activeRequests: 1, version: 'fixture0', uptimeText: '2分钟', requests: [request], requestsTruncated: false }
   switch (params.get('mode')) {
+    case 'retry_waiting': request.phase = 'retry_waiting'; break
     case 'legacy': status.requests = null; break
     case 'unknown': request.phase = 'future_phase'; delete request.sinceLastProgressMs; break
     case 'empty': status.activeRequests = 0; status.requests = []; break
@@ -54,10 +55,11 @@
           policy.activeSupported = true
           policy.restartRequired = false
           return { kind: 'restarted' }
+        case 'get_shutdown_progress': return null
         case 'get_close_request': return closeRequest
         case 'get_connection_settings': return { saved: { upstream: 'http://fixture.invalid', port: 18787 }, active: { upstream: 'http://fixture.invalid', port: 18787 }, restartRequired: false, endpoint: 'http://127.0.0.1:18787' }
         case 'get_recent_activity': return []
-        case 'start_activity_watch': return { subscription: args.subscription, revision: 0, status: 'watching', message: null }
+        case 'watch_activity_events': return { subscription: args.subscription, revision: 0, status: 'watching', message: null }
         case 'stop_activity_watch': return
         case 'get_update_state': return { phase: 'disabled', currentVersion: '0.3.4', release: null, download: null, detail: '隔离测试禁用更新', recovery: null }
         case 'respond_to_close':

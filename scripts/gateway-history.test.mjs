@@ -56,7 +56,7 @@ async function fixture(t, respond, config = {}, script = core) {
       for await (const chunk of req) chunks.push(chunk)
       const raw = Buffer.concat(chunks).toString('utf8')
       const body = JSON.parse(raw)
-      captured.push({ raw, body })
+      captured.push({ raw, body, headers: { ...req.headers } })
       const reply = await respond(body, captured.length, req, res)
       if (reply === undefined) return // 流式用例自行控制分包和结束时机。
       res.writeHead(reply.status, { 'content-type': reply.type ?? 'application/json', connection: 'close' })
@@ -811,6 +811,134 @@ for (const explicit of [false, true]) {
   })
 }
 
+// 2026-11-01：上游明确要求“不带旧加密推理的新会话”。不属于某一家客户端或模型：
+// 只有同时出现两条短语（200/400/409）才进入有界修复；普通 503/429 不得改请求体。
+const accountReasoningUnavailable = 'the upstream account bound to this conversation is unavailable; start a new conversation without previous encrypted reasoning items (request id: fixture) [trace_id=fixture]'
+const accountHistory = {
+  model: 'fixture-model', store: false, prompt_cache_key: 'account-cache-fixture',
+  client_metadata: { session_id: 'fixture-session' },
+  input: [
+    { type: 'message', id: 'msg_fixture', role: 'user', content: 'fixture prompt' },
+    { type: 'reasoning', id: 'rs_fixture', encrypted_content: 'fixture ciphertext', summary: [{ type: 'summary_text', text: 'kept summary' }] },
+    { type: 'function_call', id: 'fc_fixture', call_id: 'call_fixture', name: 'fixture', arguments: '{"value":1}' },
+    { type: 'function_call_output', id: 'fco_fixture', call_id: 'call_fixture', output: 'fixture result' },
+  ],
+}
+const accountTools = ['message', 'function_call', 'function_call_output']
+const claudeHeaders = { 'x-relay-client': 'claude', 'user-agent': 'claude-cli/fixture', 'session-id': 'fixture-session' }
+const codexHeaders = { 'x-relay-client': 'codex', 'user-agent': 'codex_cli_rs/fixture', 'session-id': 'fixture-session' }
+
+for (const carrier of ['http', 'json', 'sse']) {
+  test(`账号绑定推理不可用（${carrier}）：只删旧推理后重试，保留消息与工具`, async t => {
+    const f = await fixture(t, (_, count) => count === 1
+      ? historyError(accountReasoningUnavailable, carrier) : success)
+    const response = await f.request(accountHistory, claudeHeaders)
+    assert.equal(response.status, 200, response.body)
+    assert.equal(f.captured.length, 2)
+    assert.equal(f.captured[0].body.input.some(item => item.type === 'reasoning'), true)
+    assert.deepEqual(f.captured[1].body.input.map(item => item.type), accountTools)
+    assert.deepEqual(f.captured[1].body.client_metadata, accountHistory.client_metadata)
+    assert.equal(f.captured[1].body.prompt_cache_key, accountHistory.prompt_cache_key)
+    assert.equal(f.captured[1].body.input[0].id, 'msg_fixture', 'Claude 保留消息编号')
+    assert.equal(f.captured[1].body.input[1].call_id, 'call_fixture')
+    assert.equal(f.captured[1].headers['user-agent'], 'claude-cli/fixture')
+    assert.equal(f.captured[1].headers['session-id'], 'fixture-session')
+    assert.equal(f.captured[1].headers.authorization, 'Bearer fixture-only-not-a-key')
+  })
+}
+
+test('账号绑定推理不可用：Codex 同样适用，不按客户端或模型写死', async t => {
+  const f = await fixture(t, (_, count) => count === 1
+    ? historyError(accountReasoningUnavailable) : success)
+  const response = await f.request(accountHistory, codexHeaders)
+  assert.equal(response.status, 200, response.body)
+  assert.equal(f.captured.length, 2)
+  assert.deepEqual(f.captured[1].body.input.map(item => item.type), accountTools)
+  assert.equal(f.captured[1].body.input[0].id, undefined, 'Codex 按既有规则去掉可选编号')
+  assert.equal(f.captured[1].body.input[1].call_id, 'call_fixture')
+  assert.equal(f.captured[1].headers['user-agent'], 'codex_cli_rs/fixture')
+})
+
+test('账号绑定推理不可用：两次重试后停止，不无限重发', async t => {
+  const f = await fixture(t, () => historyError(accountReasoningUnavailable))
+  const response = await f.request(accountHistory, claudeHeaders)
+  assert.equal(response.status, 400)
+  assert.equal(f.captured.length, 3, '原始一次 + 两次重试')
+  for (const item of f.captured.slice(1)) {
+    assert.deepEqual(item.body.input.map(entry => entry.type), accountTools)
+  }
+  assert.deepEqual(f.captured[1].body, f.captured[2].body, '重试使用同一份已删推理的请求')
+})
+
+test('账号绑定推理不可用：普通 503 与 429 不得改写请求体', async t => {
+  for (const reply of [
+    { status: 503, body: { error: { type: 'server_error', message: 'Service temporarily unavailable' } } },
+    { status: 429, body: { error: { code: 'rate_limit_exceeded', type: 'too_many_requests', message: 'token rate limit exceeded' } } },
+  ]) {
+    const f = await fixture(t, () => reply)
+    const response = await f.request(accountHistory, claudeHeaders)
+    assert.ok([429, 503].includes(response.status), response.body)
+    assert.equal(f.captured.length, 5, '普通错误仍按既有重试预算')
+    for (const item of f.captured) assert.deepEqual(item.body, accountHistory)
+  }
+})
+
+for (const carrier of ['http', 'json', 'sse']) {
+  for (const message of [
+    'the upstream account bound to this conversation is unavailable',
+    'start a new conversation without previous encrypted reasoning items',
+  ]) {
+    test(`账号绑定推理不可用：单短语不触发修复 ${carrier}/${message.slice(0, 12)}`, async t => {
+      const f = await fixture(t, () => historyError(message, carrier))
+      await f.request(accountHistory, claudeHeaders)
+      for (const item of f.captured) assert.deepEqual(item.body, accountHistory)
+      assert.equal(f.rows().some(row => row.event === 'repair_applied'), false)
+    })
+  }
+}
+
+test('账号绑定推理不可用：409后混合限流沿原预算且不记忆删推理', async t => {
+  const replies = [
+    { ...historyError(accountReasoningUnavailable), status: 409 },
+    { status: 429, body: { error: { code: 'rate_limit_exceeded', message: 'token rate limit exceeded' } } },
+    { status: 503, body: { error: { code: 'server_error', message: 'Service temporarily unavailable' } } },
+    success,
+  ]
+  const f = await fixture(t, (_, count) => replies[count - 1] ?? success)
+  assert.equal((await f.request(accountHistory, claudeHeaders)).status, 200)
+  assert.equal(f.captured.length, 4, '普通限流不挤占账号错误的两次重试计数')
+  const repaired = { ...accountHistory, input: accountHistory.input.filter(item => item.type !== 'reasoning') }
+  for (const item of f.captured.slice(1)) assert.deepEqual(item.body, repaired)
+  assert.equal(f.rows().some(row => row.event === 'session_compat_enabled'), false)
+  assert.equal((await f.request(accountHistory, claudeHeaders)).status, 200)
+  assert.deepEqual(f.captured[4].body, accountHistory, '下一请求不能自动删推理')
+})
+
+// 编辑前工作区基线包含尚未提交的账号修复；与发行基线的既有差分分开验证。
+for (const carrier of ['http', 'json', 'sse']) {
+  for (const [name, message, code] of [
+    ['未知错误', 'fixture unclassified rejection', 'fixture_unknown'],
+    ['永久错误', 'invalid api key', 'invalid_api_key'],
+    ['临时限流', 'token rate limit exceeded', 'rate_limit_exceeded'],
+    ['部署缺失', 'No deployment to match this request', undefined],
+    ['账号推理', accountReasoningUnavailable, undefined],
+    ['拒绝历史改写', 'The requested item was created under a different Azure OpenAI resource', undefined],
+  ]) {
+    test(`恢复编排工作区差分 ${carrier}/${name}`, { skip: !process.env.AG_RELAY_WORKSPACE_BASELINE }, async t => {
+      const { prompt_cache_key, ...body } = accountHistory
+      if (name === '拒绝历史改写') body.previous_response_id = 'resp_fixture'
+      const results = []
+      for (const script of [resolve(process.env.AG_RELAY_WORKSPACE_BASELINE), core]) {
+        const f = await fixture(t, (_, count) => count <= 3 ? historyError(message, carrier, code) : success, {}, script)
+        const response = await f.request(body, claudeHeaders)
+        results.push({ response, sent: f.captured.map(item => ({ raw: item.raw,
+          authorization: item.headers.authorization, ua: item.headers['user-agent'], session: item.headers['session-id'] })) })
+      }
+      assert.deepEqual(results[1], results[0], '整理不能改变原恢复结果、发送次数或请求字节')
+    })
+  }
+}
+
 // 2026-10-21 线上事故：Windows 上 rename 覆盖被占用的 .1 返回 EPERM，原实现每写一条都轮转、
 // 失败又被静默吞掉，日志在 1 MiB 后停了 6 小时。这里固定两个行为：到限仍能继续写，
 // 且归档不可用时也不会静默停摆。核心把容量下限钳在 4096，测试用略高于它的预算。
@@ -845,6 +973,8 @@ test('归档无法替换时截断续写，诊断不会静默停摆', async t => 
   mkdirSync(live + '.1')
   try {
     for (let i = 0; i < 24; i++) assert.equal((await f.request()).status, 200)
+    // 缓存路由摘要也在请求结束后才写入；等最后一条诊断落盘再读，避免与追加写入抢同一行。
+    await delay(50)
     const written = readFileSync(live, 'utf8')
     assert.ok(written.length > 0, '归档不可用时仍必须写入当前档')
     assert.ok(statSync(live).size <= diagnosticsLimit, '截断兜底后当前档仍须有界')

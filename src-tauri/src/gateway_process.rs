@@ -97,6 +97,7 @@ pub enum GatewayError {
     SpawnFailed(String),
     JobSetupFailed(&'static str),
     InvalidPolicy(String),
+    InvalidProxy(&'static str),
 }
 
 impl fmt::Display for GatewayError {
@@ -113,6 +114,9 @@ impl fmt::Display for GatewayError {
                 )
             }
             GatewayError::InvalidPolicy(why) => write!(f, "策略设置无效：{why}"),
+            GatewayError::InvalidProxy(why) => {
+                write!(f, "网络代理配置无效：{why}；请使用 HTTP(S) 代理地址")
+            }
             GatewayError::SpawnFailed(why) => write!(f, "拉起网关进程失败：{why}"),
             GatewayError::JobSetupFailed(why) => {
                 write!(f, "进程树兜底（Job Object）建立失败：{why}")
@@ -176,7 +180,7 @@ fn create_kill_on_close_job() -> Result<HANDLE, &'static str> {
 }
 
 /// 通用受管 spawn：node 运行脚本，CREATE_NO_WINDOW，挂 KILL_ON_JOB_CLOSE Job。
-/// extra_env 在继承环境之上追加（网关用 17 项配置 + 诊断路径与容量）。
+/// extra_env 在最小系统环境之上追加（网关配置、诊断路径及显式代理白名单）。
 pub fn spawn_managed(
     node_exe: &Path,
     script: &Path,
@@ -379,11 +383,16 @@ fn start_gateway_process_with_env(
         });
     }
     let supervisor_script = paths.gateway_dir.join("relay-supervisor.mjs");
+    let mut env = extra_env.to_vec();
+    env.extend(
+        crate::gateway_proxy::gateway_proxy_env(settings.upstream())
+            .map_err(GatewayError::InvalidProxy)?,
+    );
     spawn_managed(
         &paths.node_exe,
         &supervisor_script,
         &paths.gateway_dir,
-        extra_env,
+        &env,
     )
 }
 

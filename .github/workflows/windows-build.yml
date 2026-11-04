@@ -1,0 +1,122 @@
+name: Windows Compile
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.1-x86_64-pc-windows-msvc
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: ${{ github.workspace }}\src-tauri\target
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.18.1'
+          cache: npm
+
+      - name: Set up the audited Rust toolchain
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+
+      - name: Cache Rust build inputs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: windows-msvc-rust-1.99.1-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Install locked frontend dependencies
+        run: npm ci --no-audit --no-fund --registry=https://registry.npmmirror.com/
+
+      - name: Validate license inputs
+        run: node scripts/check-licenses.mjs --rust-version 1.99.1
+
+      - name: Compile the release application without installers
+        run: |
+          $mappings = @(
+            @($HOME, '/builder'),
+            @((Join-Path $HOME '.cargo'), '/cargo'),
+            @((Join-Path $HOME '.rustup'), '/rustup'),
+            @($env:GITHUB_WORKSPACE, '/workspace'),
+            @($env:CARGO_TARGET_DIR, '/target')
+          )
+          $flags = @()
+          foreach ($mapping in $mappings) {
+            $absolute = [IO.Path]::GetFullPath($mapping[0])
+            foreach ($prefix in @($absolute, $absolute.Replace('\', '/')) | Select-Object -Unique) {
+              $flags += '--remap-path-prefix=' + $prefix + '=' + $mapping[1]
+            }
+          }
+          $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]31
+          npm run tauri -- build --ci --no-bundle --target x86_64-pc-windows-msvc -- --locked -j 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/release.mjs audit-paths --binary src-tauri/target/x86_64-pc-windows-msvc/release/ag-relay.exe
+
+      - name: Prepare the complete portable artifact
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE 'release-artifacts/cloud'
+          if (Test-Path -LiteralPath $root) { throw 'Artifact directory already exists.' }
+          $app = Join-Path $root 'ag-relay'
+          New-Item -ItemType Directory -Path (Join-Path $app 'resources') | Out-Null
+          Copy-Item -LiteralPath 'src-tauri/target/x86_64-pc-windows-msvc/release/ag-relay.exe' -Destination (Join-Path $app 'ag-relay.exe')
+          Copy-Item -LiteralPath 'src-tauri/binaries/node-x86_64-pc-windows-msvc.exe' -Destination (Join-Path $app 'node.exe')
+          Copy-Item -LiteralPath 'src-tauri/resources/gateway' -Destination (Join-Path $app 'resources/gateway') -Recurse
+          Copy-Item -LiteralPath 'src-tauri/generated/license-distribution/installer' -Destination (Join-Path $app 'licenses') -Recurse
+          Copy-Item -LiteralPath 'src-tauri/generated/license-distribution/third-party-sources.tar.gz' -Destination $root
+
+          $version = (Get-Content -LiteralPath 'package.json' -Raw | ConvertFrom-Json).version
+          $core = @('relay-retry-proxy.mjs', 'relay-supervisor.mjs', 'relay-start-check.mjs', 'bounded-file-log.mjs', 'gateway-config.bat')
+          $coreHashes = [ordered]@{}
+          foreach ($name in $core) {
+            $coreHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $app "resources/gateway/$name") -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $info = [ordered]@{
+            version = $version
+            commit = $env:GITHUB_SHA
+            builtAtUtc = [DateTime]::UtcNow.ToString('o')
+            artifactType = 'unsigned-portable'
+            rustToolchain = $env:RUSTUP_TOOLCHAIN
+            runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            executableSha256 = (Get-FileHash -LiteralPath (Join-Path $app 'ag-relay.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+            coreSha256 = $coreHashes
+          }
+          $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $root 'build-info.json') -Encoding utf8
+          $sums = Get-ChildItem -LiteralPath $root -File -Recurse | Sort-Object FullName | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $relative
+          }
+          [IO.File]::WriteAllText((Join-Path $root 'SHA256SUMS'), ($sums -join "`n") + "`n")
+          @(
+            '## Windows portable build',
+            "Version: $version",
+            "Commit: $env:GITHUB_SHA",
+            'Includes the EXE, bundled Node, gateway resources, license materials, source archive and checksums.',
+            'Unsigned compile-only artifact. No installer, updater signature or GitHub Release was created.'
+          ) -join "`n`n" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload the compiled application
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ag-relay-windows-x64-${{ github.run_number }}
+          path: release-artifacts/cloud/
+          if-no-files-found: error
+          retention-days: 14

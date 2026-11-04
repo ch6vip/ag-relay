@@ -21,6 +21,7 @@ pub mod gateway_diagnostics;
 pub mod gateway_diagnostics_reader;
 pub mod gateway_env;
 pub mod gateway_process;
+mod gateway_proxy;
 pub mod gateway_status;
 pub mod single_instance;
 pub mod timeutil;

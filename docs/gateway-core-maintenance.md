@@ -14,6 +14,7 @@
 | `src-tauri/resources/gateway/bounded-file-log.mjs` | 核心自有普通文件日志（`PROXY_LOG_FILE`）的有界轮转实现；被 `relay-retry-proxy.mjs` 导入，无端口/启动副作用 |
 | `src-tauri/resources/gateway/gateway-config.bat` | 入库的环境变量默认值契约；不含密钥，不要求用户执行它来启动桌面面板 |
 | `src-tauri/src/gateway_env.rs` | 桌面面板启动核心时的环境装配，与默认值契约配套维护 |
+| `src-tauri/src/gateway_proxy.rs` | 每次网关启动时解析 HTTP(S) 代理，仅将必要变量显式注入清空环境后的 Node；支持环境代理、Windows 手动代理及地址排除 |
 | `src-tauri/src/gateway_process.rs`、`gateway_control.rs`、`gateway_status.rs` | 实例路径、生命周期、控制请求与状态展示契约 |
 | `src-tauri/src/gateway_diagnostics.rs`、`gateway_diagnostics_reader.rs`、`gateway_activity.rs` | 诊断记录到中文活动事件的映射、增量读取/分页查询，以及文件通知驱动的实时活动订阅 |
 | `src-tauri/src/connection_settings.rs`、`gateway_connection.rs` | 连接设置持久化（原子替换）、环境装配与显式重启应用 |
@@ -23,9 +24,11 @@
 
 控制请求由桌面面板自身发起，无需为核心维护再引入外部项目的 `relay-control.mjs` 或启动 bat/ps1。ADR-0002 中已标明失效的「上游脚本零改动」理由仅作历史记录；其诊断字段约束、中文展示职责和未知事件诚实回退原则仍有效。
 
+代理接线位于 `start_gateway_process_with_env`，启动和安全重启共用；`spawn_managed` 仍执行 `env_clear`，不继承任意 `NODE_OPTIONS`、日志路径或 API 凭据。选中的 HTTP(S) 代理与 `NO_PROXY`、`NODE_USE_ENV_PROXY=1` 只存在于子进程环境，不写入连接设置、诊断或系统注册表。Windows 手动代理按目标上游协议选择，排除规则支持主机名、主机名加端口、`*` 通配符与 `<local>`；不执行 PAC、不读取 SOCKS 代理。动态代理值不属于 `gateway-config.bat` 的 17 项重试默认契约；低层 `spawn_managed` 不自行探测宿主代理，隔离入口仍能显式控制全部环境。
+
 ## 快速工作流与定向验证
 
-目标是用最短的有效反馈证明用户需要的行为，不以测试数量或重复构建作为完成标准。日常改动不新增 GitHub CI、提交钩子或发布前全套检查；沿用现有隔离测试与发布入口。
+目标是用最短的有效反馈证明用户需要的行为，不以测试数量或重复构建作为完成标准。日常改动不新增自动 GitHub CI、提交钩子或发布前全套检查；沿用现有隔离测试与发布入口。用户明确要求云端编译时，可按发布手册手动运行 `Windows Compile`，仅生成编译产物，不执行测试或发布。
 
 1. **先定完成条件。** 用一句话说明用户原始问题、要改变的行为和对应验证。修好错误提示或补诊断，只算该阶段完成，不能把尚未验证的原始故障标成已解决。
 2. **复用已知事实。** 先用当前会话已经确认的接入点、测试和结论；只有相关文件或现场状态变化时才重新读取。委派任务给出允许修改的文件、已确认事实、验证接缝和完成条件，让子代理继续任务而不是重新开题。

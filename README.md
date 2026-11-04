@@ -61,6 +61,10 @@ AG Relay 致力于把所有可消化的错误留在网关内部处理，加速�
 
 运行环境已随包提供，**不需要额外安装 Node**。连接设置与日志保存在 `%APPDATA%\ag-relay\`，与安装位置分离，安装和升级时保留。
 
+需要网络代理时，网关启动会优先采用启动环境中的 `HTTPS_PROXY` / `HTTP_PROXY`（HTTPS 可回退到 HTTP），其次采用 HTTP(S) 类型的 `ALL_PROXY`；没有对应环境设置时，读取当前用户已启用的 Windows 手动代理及其地址排除规则。`NO_PROXY` 继续生效，本机回环上游始终直连。只向后台 Node 注入必要的代理变量，不改系统配置，不再需要额外的 PowerShell 启动入口。
+
+修改网络代理后，需要在面板中安全重启网关才会生效；启动环境变量变更则需退出并重新启动应用。暂不解析 PAC 自动配置，也不支持 SOCKS 代理地址，请使用代理软件提供的 HTTP 或混合端口。
+
 ### 2. 把客户端指向本地网关
 
 在客户端或 CC Switch 中修改 API Base URL。**原有 Agent Router Key 仍保留在客户端。**
@@ -150,6 +154,8 @@ node scripts/release.mjs test-build --out C:\Temp\ag-relay-test-artifacts
 ```
 
 可设置 `CARGO_TARGET_DIR` 复用隔离构建缓存；不要指向现用程序目录。共享 target 的构建必须串行排队，cargo 采用 `-j 2`，不要在另一个打包任务进行时重用其 `release/bundle`。测试构建在独立 TEMP/TMP 目录产生并销毁私钥，仅输出测试配置、公钥、签名产物及醒目标记。构建子进程通过 Rust `--remap-path-prefix` 把工作树、用户 home、Cargo/Rustup 与 target 路径映射为固定无身份前缀，不改变系统环境；生成清单前扫描未压缩主程序的 UTF-8/UTF-16 本机路径残留，发现即拒绝。该检查不能代替完整资产核查。
+
+没有本机 MSVC 构建环境时，可在有权限的仓库或 fork 中手动运行 Actions 的 `Windows Compile`。它仅编译并上传完整便携目录、许可附件及校验和，保留 14 天；不使用签名私钥，不发布 Release，也不修改现用程序。具体边界见[发布手册的云端编译说明](docs/release-runbook.md#github-上仅编译)。
 
 ### 正式发布门槛
 
